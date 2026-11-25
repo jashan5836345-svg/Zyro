@@ -1,0 +1,25 @@
+name: Unpack
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack the zip
+        shell: bash
+        run: |
+          set -e
+          ZIP=$(ls *.zip | head -n 1)
+          mkdir _tmp
+          unzip -q "$ZIP" -d _tmp
+          TOP=$(ls _tmp | head -n 1)
+          rm -rf "_tmp/$TOP/.github"
+          cp -a "_tmp/$TOP/." .
+          rm -rf _tmp "$ZIP"
+          git config user.name "zyro-bot"
+          git config user.email "zyro-bot@users.noreply.github.com"
+          git add -A
+          git commit -m "Import Zyro project"
+          git push
