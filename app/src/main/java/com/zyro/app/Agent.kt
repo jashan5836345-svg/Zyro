@@ -1,0 +1,1371 @@
+package com.zyro.app
+
+import android.content.Context
+import android.graphics.Rect
+import android.os.Build
+import android.view.accessibility.AccessibilityNodeInfo
+import org.json.JSONObject
+import java.util.Locale
+
+/**
+ * Phone agent: "Zyro, Zomato par 2 biryani order karo".
+ * Loop: read the screen -> ask Gemini what to do next -> do it -> repeat.
+ * Risky steps (paying, ordering, sending, deleting) always need a spoken "haan".
+ * It never types into password fields and never works inside payment apps.
+ */
+object Agent {
+
+    private var appCtx: Context? = null
+
+    @Volatile var running = false
+        private set
+    @Volatile private var visionAsked = 0L
+    @Volatile private var cancelled = false
+    val wasCancelled: Boolean get() = cancelled
+    /** The last thing the agent said: Mission uses it as the result of a step. */
+    @Volatile var lastSay = ""
+    @Volatile private var awaiting: String? = null // question waiting for yes/no
+    @Volatile private var answer: Boolean? = null
+    @Volatile private var userReply: String? = null
+
+    private class El(val id: Int, val node: AccessibilityNodeInfo, val label: String, val r: Rect, val clickable: Boolean, val editable: Boolean)
+
+    internal val BLOCKED_PKGS = listOf(
+        "com.google.android.apps.nbu.paisa.user", "com.phonepe.app", "net.one97.paytm", "in.org.npci.upiapp",
+        "com.sbi.upi", "com.csam.icici.bank.imobile", "com.snapwork.hdfc", "com.axis.mobile", "com.dreamplug.androidapp",
+        "com.freecharge.android", "com.amazon.mShop.android.shopping.pay", "com.android.settings", "com.android.packageinstaller",
+        "com.google.android.packageinstaller", "com.android.vending"
+    )
+
+    private val RISKY = listOf(
+        "pay", "place order", "order now", "buy", "purchase", "checkout", "send", "delete", "remove",
+        "transfer", "book", "subscribe", "continue to pay", "upi", "tweet", "uninstall", "factory",
+        "भुगतान", "पेमेंट", "ऑर्डर", "खरीद", "भेज", "हटा", "डिलीट", "बुक"
+    )
+
+    fun init(ctx: Context) {
+        appCtx = ctx.applicationContext
+    }
+
+    private fun low(x: String) = x.lowercase(Locale.ROOT)
+
+    // ------------------------------------------------------------------ voice entry
+
+    private val APPS = listOf(
+        "zomato", "swiggy", "blinkit", "zepto", "instamart", "amazon", "flipkart", "myntra", "meesho", "uber", "ola", "rapido",
+        "irctc", "makemytrip", "redbus", "bookmyshow", "youtube", "instagram", "spotify", "maps", "netflix", "hotstar", "jiohotstar", "jio hotstar", "gmail", "prime video", "sonyliv", "zee5", "whatsapp", "telegram",
+        "जोमैटो", "ज़ोमैटो", "स्विगी", "ब्लिंकिट", "ज़ेप्टो", "अमेज़न", "अमेजन", "फ्लिपकार्ट", "मिंत्रा", "उबर", "ओला", "रैपिडो"
+    )
+    private val ACTS = listOf(
+        "order", "book", "buy", "search", "download", "install", "ऑर्डर", "बुक", "खरीद", "मंगा", "मँगा", "मंगवा", "ढूंढ", "खोज",
+        "mangwa", "manga", "kharid", "dhundh", "khoj", "add to cart", "cart"
+    )
+    private val ACTS2 = listOf("chalu", "चालू", "chala", "चला", "laga", "लगा", "play", "login", "log in", "लॉगिन", "dekh", "देख", "match", "मैच", "sign in")
+    private val TRIGGERS = listOf(
+        "agent", "एजेंट", "autopilot", "ऑटोपायलट", "khud kar", "खुद कर", "apne aap kar", "अपने आप कर", "mere liye kar", "मेरे लिए कर"
+    )
+
+    fun handle(hands: Hands, t: String, words: List<String>, raw: String): String? {
+        val ctx = appCtx ?: return null
+        val rl = low(raw)
+        if (running && (rl.contains("agent status") || rl.contains("kya kar rahe") || rl.contains("क्या कर रहे"))) {
+            return "मैं अभी आपका काम कर रहा हूँ: $task"
+        }
+        if (listOf("zyro check", "health check", "ज़ीरो चेक", "जीरो चेक", "सब चेक", "sab check", "self check", "diagnos").any { rl.contains(it) }) return Health.run(ctx, hands)
+        if (listOf("vision", "विज़न", "विजन").any { rl.contains(it) }) {
+            if (listOf("band", "बंद", "off", "stop").any { rl.contains(it) }) return Vision.stop(ctx)
+            if (listOf("chalu", "चालू", "on", "start", "shuru", "शुरू").any { rl.contains(it) }) return Vision.ask(ctx)
+        }
+        val tn = Local.strip(rl)
+        val explicit = TRIGGERS.any { tn.contains(Local.strip(it)) }
+        val smart = !explicit && APPS.any { tn.contains(Local.strip(it)) } && ACTS.any { tn.contains(Local.strip(it)) } &&
+            (rl.contains(" par ") || rl.contains(" पर ") || rl.contains(" me ") || rl.contains(" में ") || rl.contains(" on ") || rl.contains(" se ") || rl.contains(" से "))
+        val heavy = !explicit && !smart && APPS.any { tn.contains(Local.strip(it)) } && ACTS2.any { tn.contains(Local.strip(it)) } &&
+            (tn.contains(Local.strip("login")) || tn.contains(Local.strip("लॉगिन")) || tn.contains(Local.strip("karke")) || tn.contains(Local.strip("करके")) || raw.trim().split(Regex("\\s+")).size >= 6)
+        val connectors = listOf("phir", "फिर", "uske baad", "उसके बाद", "then", "jakar", "जाकर", "jaakar", "karke", "करके")
+        val multi = !explicit && !smart && raw.trim().split(Regex("\\s+")).size >= 9 &&
+            connectors.any { tn.contains(Local.strip(it)) } &&
+            listOf("open", "kholo", "खोल", "baat", "बात", "upload", "bhej", "भेज", "search", "ढूंढ", "download", "लिख", "likh").any { tn.contains(Local.strip(it)) }
+        if (!explicit && !smart && !multi && !heavy) return null
+        if (running) {
+            // a new, different task replaces the old one instead of being refused
+            cancel()
+            var w = 0
+            while (running && w < 30) { Thread.sleep(100); w++ }
+            if (running) return "मैं पहले से एक काम कर रहा हूँ। उसे रोकना हो तो बोलो रुको।"
+        }
+        var job = raw.trim()
+        for (tr in TRIGGERS) {
+            val i = low(job).indexOf(tr)
+            if (i >= 0) {
+                job = (job.substring(0, i) + " " + job.substring(i + tr.length)).trim()
+                break
+            }
+        }
+        job = job.trim(' ', ',', ':', '.')
+        if (job.length < 4) return "बताओ क्या करना है? जैसे: एजेंट, ज़ोमैटो पर दो बिरयानी ऑर्डर करो।"
+        return start(ctx, hands, job)
+    }
+
+    private val YES = listOf("haan", "han", "yes", "ha", "ji", "ok", "okay", "kar do", "karo", "हाँ", "हां", "हा", "जी", "ठीक", "ओके", "कर दो", "करो", "confirm", "कन्फर्म")
+    private val NO = listOf("nahi", "nahin", "no", "mat", "ruko", "ruk", "stop", "cancel", "band", "नहीं", "मत", "रुको", "रुक", "बंद", "कैंसिल", "छोड़")
+
+    /** Answers to the agent's questions, and "ruko" while it works. */
+    fun handlePending(t: String, words: List<String>): String? {
+        if (!running) return null
+        val ws = words.map { Local.strip(it) }
+        val no = NO.any { ws.contains(Local.strip(it)) }
+        val yes = YES.any { ws.contains(Local.strip(it)) }
+        if (awaiting != null) {
+            if (no && !yes) {
+                answer = false
+                return "ठीक है, रोक दिया।"
+            }
+            if (yes) {
+                answer = true
+                return "ठीक है।"
+            }
+            if (awaiting == "ask") {
+                userReply = t
+                return "ठीक है।"
+            }
+            return null
+        }
+        if (no && ws.size <= 4) {
+            cancel()
+            return "ठीक है, काम रोक दिया।"
+        }
+        return null
+    }
+
+    fun cancel() {
+        if (!running) return
+        cancelled = true
+        answer = false
+        userReply = ""
+    }
+
+    // ------------------------------------------------------------------ the loop
+
+    @Volatile private var task = ""
+
+    fun start(ctx: Context, hands: Hands, job: String): String {
+        if (!Prefs.hasGemini) return "एजेंट के लिए Gemini key चाहिए। सेटिंग में डालो।"
+        if (hands.service == null) return "एजेंट के लिए Accessibility में Zyro चालू करो।"
+        if (running) return "मैं पहले से एक काम कर रहा हूँ।"
+        running = true
+        cancelled = false
+        awaiting = null
+        answer = null
+        userReply = null
+        task = job
+        keepAwake(true)
+        Thread { try { loop(ctx, hands, job) } catch (e: Exception) { say("काम के बीच में दिक्कत आ गई: ${e.message}") } finally { running = false; awaiting = null; keepAwake(false) } }.start()
+        return "ठीक है, शुरू करता हूँ। बीच में रोकना हो तो बोलो रुको।"
+    }
+
+    private fun say(text: String) {
+        val c = appCtx ?: return
+        lastSay = text
+        Assistant.get(c).announce(text)
+    }
+
+    private fun observe(hands: Hands): Triple<String, List<El>, String>? {
+        val svc = hands.service ?: return null
+        var root = svc.rootInActiveWindow
+        if (root == null) {
+            // fallback: pick the active application window
+            try {
+                root = svc.windows.filter { it.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION }
+                    .sortedByDescending { if (it.isActive) 2 else if (it.isFocused) 1 else 0 }
+                    .firstNotNullOfOrNull { it.root }
+            } catch (e: Exception) {}
+        }
+        if (root == null) return null
+        val pkg = root.packageName?.toString() ?: ""
+        val list = ArrayList<El>()
+        var canDown = false
+        var canUp = false
+        fun walk(n: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 30) return
+            if (n.isScrollable && n.isVisibleToUser) {
+                try {
+                    for (ac in n.actionList) {
+                        if (ac.id == AccessibilityNodeInfo.ACTION_SCROLL_FORWARD) canDown = true
+                        if (ac.id == AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD) canUp = true
+                    }
+                } catch (e: Exception) {}
+            }
+            if (list.size >= 130) return
+            val label = if (n.isPassword) "(password field)" else listOfNotNull(n.text?.toString()?.take(50), n.contentDescription?.toString()?.take(50))
+                .filter { it.isNotBlank() }.joinToString(" | ")
+            val interesting = label.isNotEmpty() || n.isClickable || n.isEditable
+            if (interesting && n.isVisibleToUser) {
+                val r = Rect()
+                n.getBoundsInScreen(r)
+                if (r.width() > 0 && r.height() > 0) list.add(El(list.size + 1, n, label, r, n.isClickable, n.isEditable))
+            }
+            for (i in 0 until n.childCount) {
+                val c = n.getChild(i) ?: continue
+                walk(c, depth + 1)
+            }
+        }
+        walk(root, 0)
+        if (list.size > 55) {
+            // too many: keep the useful ones first (input boxes, labelled buttons, a few icons), then plain text
+            val raw = ArrayList(list)
+            val picked = HashSet<Int>()
+            fun take(max: Int, pred: (El) -> Boolean) {
+                var c = 0
+                for (e in raw) {
+                    if (picked.size >= 55 || c >= max) break
+                    if (e.id !in picked && pred(e)) { picked.add(e.id); c++ }
+                }
+            }
+            take(10) { it.editable }
+            take(32) { it.clickable && it.label.isNotEmpty() }
+            take(8) { it.clickable && it.label.isEmpty() }
+            take(55) { true }
+            list.clear()
+            raw.filter { it.id in picked }.forEachIndexed { i, e -> list.add(El(i + 1, e.node, e.label, e.r, e.clickable, e.editable)) }
+        }
+        val sb = StringBuilder()
+        for (e in list) {
+            sb.append(e.id).append(": ")
+            sb.append(if (e.label.isEmpty()) "(no label @${e.r.centerX()},${e.r.centerY()})" else "\"" + e.label + "\"")
+            val f = ArrayList<String>()
+            if (e.clickable) f.add("tap")
+            if (e.editable) f.add("input")
+            if (f.isNotEmpty()) sb.append(" [").append(f.joinToString(",")).append("]")
+            sb.append('\n')
+        }
+        if (canDown || canUp) sb.append("(scrolling: more content below = ").append(if (canDown) "yes" else "no")
+            .append(", more above = ").append(if (canUp) "yes" else "no").append(")\n")
+        return Triple(pkg, list, sb.toString())
+    }
+
+    private fun risky(label: String): Boolean {
+        val l = low(label)
+        if (l.isEmpty()) return false
+        return RISKY.any { l.contains(it) }
+    }
+
+    /** Asks a yes/no question out loud and waits up to 45 s. */
+    private fun confirm(question: String): Boolean {
+        answer = null
+        awaiting = "confirm"
+        say(question)
+        val end = System.currentTimeMillis() + 45_000
+        while (answer == null && !cancelled && System.currentTimeMillis() < end) Thread.sleep(250)
+        val a = answer == true
+        awaiting = null
+        answer = null
+        return a
+    }
+
+    private fun askUser(question: String): String? {
+        userReply = null
+        awaiting = "ask"
+        say(question)
+        val end = System.currentTimeMillis() + 60_000
+        while (userReply == null && !cancelled && System.currentTimeMillis() < end) Thread.sleep(250)
+        val r = userReply
+        awaiting = null
+        userReply = null
+        return if (cancelled || r.isNullOrBlank()) null else r
+    }
+
+    private val REFLEX_ALWAYS = setOf("while using the app", "only this time", "no thanks", "no, thanks", "skip ad", "skip ads", "got it", "dismiss", "not now", "maybe later", "अभी नहीं")
+    private val REFLEX_SOFT = setOf("skip", "later", "close", "बाद में", "छोड़ें")
+
+    @Volatile private var planText = ""
+    @Volatile private var progress = ""
+    private var planThread: Thread? = null
+
+    private var wl: android.os.PowerManager.WakeLock? = null
+
+    /** Keeps the screen on while the agent works, so it never stalls on a dimmed or locked screen. */
+    private fun keepAwake(on: Boolean) {
+        val c = appCtx ?: return
+        try {
+            wl?.let { if (it.isHeld) it.release() }
+            wl = null
+            if (on) {
+                val pm = c.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+                @Suppress("DEPRECATION")
+                val w = pm.newWakeLock(android.os.PowerManager.SCREEN_BRIGHT_WAKE_LOCK or android.os.PowerManager.ACQUIRE_CAUSES_WAKEUP, "zyro:agent")
+                w.acquire(16 * 60_000L)
+                wl = w
+            }
+        } catch (e: Exception) {}
+    }
+
+    private val DEEP_APPS = listOf("youtube", "maps", "spotify", "amazon", "flipkart", "google", "यूट्यूब", "मैप", "स्पोटिफाई", "अमेज़न", "अमेजन", "फ्लिपकार्ट", "गूगल", "play store", "playstore", "प्ले स्टोर", "netflix", "नेटफ्लिक्स", "reddit", "रेडिट", "pinterest", "पिंटरेस्ट")
+
+    private val FAST_STOP = setOf(
+        "khol", "kholo", "खोल", "खोलो", "open", "search", "serch", "karo", "kar", "करो", "कर", "dhundo", "dhoondo", "ढूंढो", "ढूँढो", "dhundh", "chalao", "chala", "चलाओ", "चला",
+        "play", "laga", "lagao", "लगाओ", "लगा", "dekho", "dikhao", "दिखाओ", "देखो", "par", "pe", "पर", "पे", "mein", "me", "में", "ka", "ki", "ke", "ko", "का", "की", "के", "को",
+        "wahan", "वहां", "वहाँ", "jaldi", "जल्दी", "please", "plz", "zara", "ज़रा", "जरा", "mujhe", "मुझे", "ek", "एक", "ab", "अब", "me", "app", "ऐप", "एप", "bhai", "यार", "yaar", "sunao", "सुनाओ",
+        "youtube", "यूट्यूब", "maps", "map", "मैप", "मैप्स", "spotify", "स्पोटिफाई", "amazon", "अमेज़न", "अमेजन", "flipkart", "फ्लिपकार्ट", "google", "गूगल", "play", "store", "playstore", "प्ले", "स्टोर", "install", "इंस्टॉल", "netflix", "नेटफ्लिक्स", "reddit", "रेडिट", "pinterest", "पिंटरेस्ट"
+    )
+
+    /** (app, query) when the job is one short plain sentence like "YouTube pe tagda gaana chalao"; otherwise null. */
+    private fun fastGuess(jl: String): Pair<String, String>? {
+        val words = jl.split(Regex("[\\s,।.!?]+")).filter { it.isNotEmpty() }
+        if (words.size > 9) return null
+        val blockers = listOf("download", "डाउनलोड", "message", "मैसेज", "call", "कॉल", "whatsapp", "व्हाट्सएप", " aur ", " और ", " phir ", " फिर ", " then ", " and ", "like", "लाइक", "comment", "कमेंट", "share", "शेयर", "subscribe", "सब्सक्राइब", "order", "ऑर्डर", "buy", "खरीद")
+        val padded = " $jl "
+        if (blockers.any { padded.contains(it) }) return null
+        val app = when {
+            jl.contains("youtube") || jl.contains("यूट्यूब") -> "youtube"
+            jl.contains("spotify") || jl.contains("स्पोटिफाई") -> "spotify"
+            jl.contains("flipkart") || jl.contains("फ्लिपकार्ट") -> "flipkart"
+            jl.contains("netflix") || jl.contains("नेटफ्लिक्स") -> "netflix"
+            jl.contains("reddit") || jl.contains("रेडिट") -> "reddit"
+            jl.contains("pinterest") || jl.contains("पिंटरेस्ट") -> "pinterest"
+            jl.contains("amazon") || jl.contains("अमेज़न") || jl.contains("अमेजन") -> "amazon"
+            jl.contains("play store") || jl.contains("playstore") || jl.contains("प्ले स्टोर") -> "playstore"
+            jl.contains("maps") || jl.contains("मैप") -> "maps"
+            jl.contains("google") || jl.contains("गूगल") -> "google"
+            else -> return null
+        }
+        val q = words.filter { it !in FAST_STOP }.joinToString(" ")
+        if (q.isEmpty() || q.split(" ").size > 7) return null
+        // "shorts chalao" means the Shorts tab, not a search for the word shorts
+        if (app == "youtube" && q.split(" ").all { it in setOf("shorts", "short", "शॉर्ट्स", "शॉर्ट", "शार्ट्स", "reels", "रील्स") }) return null
+        return Pair(app, q)
+    }
+
+    // ------------------------------------------------------------------ scripted YouTube download (no AI call per step)
+
+    private val YT_DL_STOP = setOf(
+        "download", "डाउनलोड", "video", "वीडियो", "videos", "360p", "144p", "360", "144", "quality", "क्वालिटी", "nai", "nayi", "naya", "नई", "नयी", "नया", "new", "latest",
+        "wali", "वाली", "hai", "है", "karke", "करके", "chahiye", "चाहिए", "do", "दो", "de", "दे", "se", "से", "jaldi", "जल्दी", "quickly", "fast"
+    )
+
+    /** (search words, newest first, 144p instead of 360p) for a plain "YouTube pe X ki video download karo", else null. */
+    private fun ytDownloadPlan(jl: String): Triple<String, Boolean, Boolean>? {
+        if (!(jl.contains("youtube") || jl.contains("यूट्यूब"))) return null
+        if (!(jl.contains("download") || jl.contains("डाउनलोड"))) return null
+        val padded = " $jl "
+        if (listOf(" aur ", " और ", " phir ", " फिर ", " then ", " and ", "whatsapp", "share", "शेयर", "send", "bhej", "भेज", "short", "शॉर्ट").any { padded.contains(it) }) return null
+        val latest = listOf("nai ", "nayi", "naya", "नई", "नयी", "नया", "new", "latest").any { padded.contains(it) }
+        val low144 = jl.contains("144")
+        val words = jl.split(Regex("[\\s,।.!?]+")).filter { it.isNotEmpty() }
+        // "meri / mere / apni video": the user's OWN video, not a search word -> let the normal agent handle it
+        if (words.any { it in setOf("meri", "mera", "mere", "मेरी", "मेरा", "मेरे", "apni", "apna", "अपनी", "अपना", "my") }) return null
+        val q = words.filter { it !in FAST_STOP && it !in YT_DL_STOP }.joinToString(" ")
+        if (q.isEmpty() || q.split(" ").size > 6) return null
+        return Triple(q, latest, low144)
+    }
+
+    /**
+     * Search link (videos only, newest first when asked) then: first result's ⋮ -> "Download video" -> quality -> Download.
+     * Returns the sentence to say when the download started, or null when any step was not there (the normal agent then continues from the open results).
+     */
+    private fun waitEl(hands: Hands, ms: Long, pick: (List<El>) -> El?): El? {
+        val end = System.currentTimeMillis() + ms
+        while (System.currentTimeMillis() < end && !cancelled) {
+            val o = observe(hands)
+            val el = o?.second?.let(pick)
+            if (el != null) return el
+            Thread.sleep(220)
+        }
+        return null
+    }
+
+    private fun ytFastDownload(ctx: Context, hands: Hands, q: String, latest: Boolean, low144: Boolean): String? {
+        fun fl(m: String) { try { Assistant.get(ctx).note("⚙ fast download: $m") } catch (ex: Exception) { } }
+        val e = java.net.URLEncoder.encode(q, "UTF-8")
+        val sp = if (latest) "&sp=CAISAhAB" else "&sp=EgIQAQ%253D%253D"
+        try {
+            val i = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://www.youtube.com/results?search_query=$e$sp"))
+            i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            i.setPackage("com.google.android.youtube")
+            ctx.startActivity(i)
+        } catch (ex: Exception) { fl("could not open the search link"); return null }
+        val dm = ctx.resources.displayMetrics
+        fun moreBtns(els: List<El>) = els.filter {
+            val l = low(it.label)
+            (l.contains("more options") || l.contains("action menu") || l == "more") && it.r.top > dm.heightPixels * 0.2 && it.r.centerX() > dm.widthPixels * 0.75
+        }.sortedBy { it.r.top }
+        var dl: El? = null
+        val dlPick = { els: List<El> -> els.firstOrNull { val l = low(it.label); l.contains("download") && !l.contains("downloads") && !l.contains("downloaded") } }
+        // try the first few videos: a live stream or a video that does not allow downloads has a menu without 'Download video'
+        for (idx in 0..3) {
+            val more = waitEl(hands, if (idx == 0) 10_000 else 3000) { els -> moreBtns(els).getOrNull(idx) } ?: break
+            Thread.sleep(600) // the list is still settling when the first button shows
+            tapEl(hands, more)
+            dl = waitEl(hands, 2500, dlPick)
+            if (dl == null) {
+                hands.tap(more.r.centerX(), more.r.centerY())
+                dl = waitEl(hands, 2000, dlPick)
+            }
+            if (dl != null) break
+            val o = observe(hands)
+            val sheet = o?.second?.any { val l = low(it.label); l.contains("share") || l.contains("report") || l.contains("save to") || l.contains("play next") } == true
+            fl("video ${idx + 1}: its menu has no 'Download video'" + (if (sheet) " (live or not allowed); trying the next video" else ""))
+            if (sheet) { hands.press("back"); Thread.sleep(500) }
+        }
+        if (dl == null) {
+            val seen = try { (observe(hands)?.second ?: emptyList()).map { it.label.trim().take(20) }.filter { it.isNotEmpty() }.distinct().take(14).joinToString(" | ") } catch (ex: Exception) { "" }
+            fl("step 1/2 failed. On screen: $seen")
+            return null
+        }
+        tapEl(hands, dl)
+        val want = if (low144) "144p" else "360p"
+        val opt = waitEl(hands, 3000) { els -> els.firstOrNull { low(it.label).contains(want) } }
+        if (opt != null) {
+            tapEl(hands, opt)
+            Thread.sleep(250)
+            // the button; if it is not listed by name, press the spot to the right of Cancel (same row)
+            var go = waitEl(hands, 1800) { els -> els.filter { low(it.label).trim() == "download" }.maxByOrNull { it.r.top } }
+            if (go != null) tapEl(hands, go)
+            else {
+                val c = waitEl(hands, 1500) { els -> els.firstOrNull { low(it.label).trim() == "cancel" } }
+                if (c == null) { fl("step 4 failed: dialog has no Download or Cancel button"); return null }
+                hands.tap(c.r.centerX() + (dm.widthPixels * 0.457).toInt(), c.r.centerY())
+                fl("pressed the spot right of Cancel")
+            }
+        } else fl("no quality dialog; assumed the download started directly")
+        Thread.sleep(700)
+        return "डाउनलोड शुरू हो गया ($want)। YouTube में You टैब, फिर Downloads में दिखेगा।"
+    }
+
+
+    // ------------------------------------------------------------------ scripted Instagram (no AI call per step)
+
+    private val IG_STOP = setOf("instagram", "insta", "इंस्टाग्राम", "इंस्टा", "account", "अकाउंट", "profile", "प्रोफाइल", "id", "आईडी", "wala", "wali", "वाला", "वाली", "ka", "ki", "ko", "ke",
+        "ye", "yeh", "ise", "is", "isko", "इसको", "इसे", "reel", "reels", "रील", "रील्स", "search", "dhundo", "dhoondo", "khojo", "ढूंढो", "ढूँढो", "खोजो", "karo", "kar", "करो", "कर", "tab", "टैब")
+
+    /** "Instagram kholo / Reels chalao / is reel ko like-save-download karo / next reel / X search karo": straight taps, no AI. Null = let the normal agent do it. */
+    private fun igQuick(ctx: Context, hands: Hands, jl: String): String? {
+        val named = jl.contains("instagram") || jl.contains("insta") || jl.contains("इंस्टा")
+        val reelWord = (jl.contains("reel") || jl.contains("रील")) && !jl.contains("youtube") && !jl.contains("यूट्यूब")
+        if (!named && !reelWord) return null
+        val padded = " $jl "
+        if (listOf(" aur ", " और ", " phir ", " फिर ", " then ", " and ", "whatsapp", "व्हाट्सएप", "bhej", "भेज", "comment", "कमेंट", "message", "मैसेज", "post", "पोस्ट", "delete", "डिलीट", "log out", "logout", "password").any { padded.contains(it) }) return null
+        fun has(vararg k: String) = k.any { jl.contains(it) }
+        val dm = ctx.resources.displayMetrics
+        val w = dm.widthPixels
+        val h = dm.heightPixels
+        fun fl(m: String) { try { Assistant.get(ctx).note("⚙ insta: $m") } catch (ex: Exception) { } }
+        val wantDl = has("download", "डाउनलोड")
+        val wantLike = has("like", "लाइक")
+        val wantSave = !wantDl && has("save", "सेव")
+        val wantNext = has("next", "agli", "अगली", "अगला", "agla", "dusri", "दूसरी", "skip")
+        val wantSearch = !wantDl && has("search", "dhund", "dhond", "ढूं", "ढूँ", "khoj", "खोज")
+        val openWord = has("khol", "खोल", "open", "chala", "चला", "dekh", "देख", "dikha", "दिखा", "laga", "लगा", "play")
+        val tabName = when {
+            has("reel", "रील") -> 1
+            has("message", "मैसेज", "inbox", "dm") -> 2
+            has("saved", "सेव्ड") -> 5
+            has("profile", "प्रोफाइल") -> 4
+            has("home", "होम", "feed", "फीड") -> 0
+            else -> -1
+        }
+        val acting = wantDl || wantLike || wantSave || wantNext
+        if (!acting && !wantSearch && !(openWord && (tabName >= 0 || named))) return null
+
+        val r = openSmart(hands, "instagram")
+        if (!r.startsWith("Opened")) return null
+        Thread.sleep(900)
+        fun bottomTab(i: Int, names: List<String>): String {
+            val el = waitEl(hands, 5000) { els -> els.firstOrNull { e -> e.r.top > h * 0.84 && e.r.bottom < h * 0.97 && names.any { low(e.label).trim().startsWith(it) } } }
+            if (el != null) return tapEl(hands, el)
+            return hands.tap(((i * 2 + 1) * w) / 10, (h * 0.917).toInt())
+        }
+        fun goTab(t: Int) {
+            when (t) {
+                0 -> bottomTab(0, listOf("home"))
+                1 -> bottomTab(1, listOf("reels", "reel"))
+                2 -> bottomTab(2, listOf("messages", "message", "direct"))
+                3 -> bottomTab(3, listOf("search", "explore"))
+                4 -> bottomTab(4, listOf("profile"))
+            }
+        }
+        fun rightEdge(vararg keys: String): El? = waitEl(hands, 3500) { els ->
+            els.firstOrNull { e -> e.r.centerX() > w * 0.8 && e.r.centerY() > h * 0.12 && e.r.centerY() < h * 0.9 && keys.any { k -> low(e.label).trim().startsWith(k) } }
+        }
+
+        if (wantLike || wantSave || wantDl || wantNext) {
+            // act on whatever reel/post is on screen; if Instagram just opened, go to Reels first
+            if (openWord && has("reel", "रील") && !wantNext) { goTab(1); Thread.sleep(1500) }
+            if (wantNext) {
+                hands.swipe(w / 2, (h * 0.75).toInt(), w / 2, (h * 0.25).toInt(), 260)
+                Thread.sleep(900)
+                if (!wantLike && !wantSave && !wantDl) return "अगली रील।"
+            }
+            if (wantLike) {
+                val liked = rightEdge("liked", "unlike")
+                if (liked != null) return "ये रील पहले से लाइक है।"
+                val el = rightEdge("like")
+                if (el == null) { fl("like button not found"); return null }
+                tapEl(hands, el); Thread.sleep(500)
+                return "लाइक कर दिया।"
+            }
+            if (wantSave) {
+                val el = rightEdge("save", "add to saved", "bookmark")
+                if (el == null) { fl("save button not found"); return null }
+                tapEl(hands, el); Thread.sleep(500)
+                return "सेव कर दिया।"
+            }
+            if (wantDl) {
+                val sh = rightEdge("share", "send") ?: run { fl("share button not found"); return null }
+                tapEl(hands, sh)
+                var dl: El? = null
+                for (i in 0 until 4) {
+                    dl = waitEl(hands, if (i == 0) 3500 else 1200) { els -> els.firstOrNull { e -> val l = low(e.label).trim(); l.startsWith("download") && !l.startsWith("downloads") && e.r.top > h * 0.55 } }
+                    if (dl != null) break
+                    hands.swipe((w * 0.85).toInt(), (h * 0.92).toInt(), (w * 0.15).toInt(), (h * 0.92).toInt(), 250)
+                    Thread.sleep(500)
+                }
+                if (dl == null) { hands.press("back"); return "इस रील में Download का ऑप्शन नहीं है, बनाने वाले ने बंद किया है।" }
+                tapEl(hands, dl)
+                Thread.sleep(1500)
+                return "डाउनलोड शुरू कर दिया, गैलरी में दिखेगा।"
+            }
+        }
+        if (wantSearch) {
+            val q = jl.split(Regex("[\\s,।.!?]+")).filter { it.isNotEmpty() && it !in FAST_STOP && it !in IG_STOP }.joinToString(" ")
+            if (q.isEmpty() || q.split(" ").size > 5) return null
+            goTab(3)
+            val box = waitEl(hands, 5000) { els -> els.firstOrNull { e -> e.r.top < h * 0.25 && low(e.label).contains("search") } } ?: run { fl("search box not found"); return null }
+            tapEl(hands, box); Thread.sleep(500)
+            hands.typeText(q)
+            val first = q.split(" ")[0]
+            val res = waitEl(hands, 6000) { els -> els.firstOrNull { e -> !e.editable && e.r.top > h * 0.12 && e.r.top < h * 0.6 && low(e.label).contains(first) && !low(e.label).contains("search") } }
+            if (res == null) { fl("no result row for $q"); return null }
+            tapEl(hands, res); Thread.sleep(1200)
+            return "$q का अकाउंट खोल दिया।"
+        }
+        if (tabName == 5) {
+            goTab(4)
+            val menu = waitEl(hands, 5000) { els -> els.firstOrNull { e -> e.r.top < h * 0.15 && e.r.centerX() > w * 0.85 && (low(e.label).contains("menu") || low(e.label).contains("options") || low(e.label).contains("settings")) } }
+            if (menu == null) hands.tap((w * 0.93).toInt(), (h * 0.075).toInt()) else tapEl(hands, menu)
+            val sv = waitEl(hands, 4000) { els -> els.firstOrNull { e -> low(e.label).trim().startsWith("saved") } } ?: return null
+            tapEl(hands, sv)
+            return "Saved खोल दिया।"
+        }
+        if (tabName >= 0) { goTab(tabName); return when (tabName) { 1 -> "Reels खोल दी।"; 2 -> "Messages खोल दिए।"; 4 -> "Profile खोल दी।"; else -> "Home खोल दिया।" } }
+        return "Instagram खोल दिया।"
+    }
+
+
+    // ------------------------------------------------------------------ scripted WhatsApp (no AI call per step)
+
+    private val WA_STOP = setOf("whatsapp", "व्हाट्सएप", "व्हाट्सऐप", "वॉट्सऐप", "वाट्सएप", "chat", "चैट", "chats", "kholo", "खोलो", "khol", "खोल", "open", "karo", "kar", "करो", "कर", "ka", "ki", "ke", "ko", "ka", "का", "की", "के", "को",
+        "dikha", "dikhao", "दिखाओ", "dekho", "देखो", "status", "स्टेटस", "wala", "wali", "वाला", "वाली", "me", "mein", "में", "pe", "par", "पर", "se", "से", "ye", "is", "isko", "tab", "टैब", "unread", "favorites", "groups")
+
+    /** "WhatsApp kholo / Updates / Calls / Unread chats / Groups / Rajeev ki chat kholo / Rajeev ka status dekho / Settings": straight taps, no AI. Sending, calling, deleting go through the normal (confirmed) paths. */
+    private fun waQuick(ctx: Context, hands: Hands, jl: String): String? {
+        if (!(jl.contains("whatsapp") || jl.contains("व्हाट्सएप") || jl.contains("व्हाट्सऐप") || jl.contains("वॉट्सऐप") || jl.contains("वाट्सएप"))) return null
+        val padded = " $jl "
+        if (listOf(" aur ", " और ", " phir ", " फिर ", " then ", " and ", "bhej", "भेज", "send", "likh", "लिख", "message", "मैसेज", "call", "कॉल", "voice", "वॉइस", "block", "ब्लॉक", "delete", "डिलीट", "clear", "post", "पोस्ट", "payment", "पेमेंट", "password", "logout", "log out", "download", "डाउनलोड").any { padded.contains(it) }) return null
+        fun has(vararg k: String) = k.any { jl.contains(it) }
+        val dm = ctx.resources.displayMetrics
+        val w = dm.widthPixels
+        val h = dm.heightPixels
+        fun fl(m: String) { try { Assistant.get(ctx).note("⚙ whatsapp: $m") } catch (ex: Exception) { } }
+        val chip = when {
+            has("unread", "अनरीड", "अनपढ़ी") -> "unread"
+            has("favorite", "favourite", "फेवरेट") -> "favorites"
+            has("group", "ग्रुप") -> "groups"
+            else -> ""
+        }
+        val tab = when {
+            has("calls", "call history", "call log", "कॉल हिस्ट्री", "कॉल लॉग") -> 3
+            has("communit", "कम्युनिटी") -> 2
+            has("updates", "अपडेट", "status", "स्टेटस") -> 1
+            has("settings", "सेटिंग") -> 9
+            else -> 0
+        }
+        val q = jl.split(Regex("[\\s,।.!?]+")).filter { it.isNotEmpty() && it !in FAST_STOP && it !in WA_STOP }.joinToString(" ")
+        val openChat = has("chat", "चैट") && q.isNotEmpty() && chip.isEmpty()
+        val statusOf = has("status", "स्टेटस") && q.isNotEmpty()
+        val openWord = has("khol", "खोल", "open", "dikha", "दिखा", "dekh", "देख", "chala", "चला", "laga", "लगा", "show")
+        if (!openWord && !openChat && !statusOf) return null
+        if (q.split(" ").size > 4) return null
+
+        val r = openSmart(hands, "whatsapp")
+        if (!r.startsWith("Opened")) return null
+        Thread.sleep(900)
+        val tabNames = listOf("chats", "updates", "communities", "calls")
+        fun bottomTab(i: Int): Boolean {
+            for (attempt in 0 until 3) {
+                val el = waitEl(hands, if (attempt == 0) 3000 else 1800) { els -> els.firstOrNull { e -> e.r.top > h * 0.84 && e.r.bottom < h * 0.97 && low(e.label).trim().startsWith(tabNames[i]) } }
+                if (el != null) { tapEl(hands, el); return true }
+                hands.press("back"); Thread.sleep(500)   // inside a chat/search: come back out
+            }
+            hands.tap(((i * 2 + 1) * w) / 8, (h * 0.915).toInt())
+            return true
+        }
+        fun menuSettings(): String? {
+            val more = waitEl(hands, 4000) { els -> els.firstOrNull { e -> e.r.top < h * 0.14 && e.r.centerX() > w * 0.88 && (low(e.label).contains("more options") || low(e.label).contains("menu")) } }
+            if (more == null) hands.tap((w * 0.95).toInt(), (h * 0.075).toInt()) else tapEl(hands, more)
+            val st = waitEl(hands, 4000) { els -> els.firstOrNull { e -> low(e.label).trim() == "settings" } } ?: run { fl("Settings item not found"); return null }
+            tapEl(hands, st)
+            return "WhatsApp Settings खोल दी।"
+        }
+
+        if (tab == 9) { bottomTab(0); return menuSettings() }
+        if (statusOf) {
+            bottomTab(1)
+            val first = q.split(" ")[0]
+            val row = waitEl(hands, 5000) { els -> els.firstOrNull { e -> e.r.top > h * 0.2 && e.r.top < h * 0.9 && low(e.label).contains(first) } } ?: run { fl("no status row for $q"); return null }
+            tapEl(hands, row); Thread.sleep(800)
+            return "$q का स्टेटस खोल दिया।"
+        }
+        if (openChat) {
+            bottomTab(0)
+            val box = waitEl(hands, 5000) { els -> els.firstOrNull { e -> e.r.top < h * 0.25 && low(e.label).contains("search") } } ?: run { fl("search box not found"); return null }
+            tapEl(hands, box); Thread.sleep(500)
+            hands.typeText(q)
+            val first = q.split(" ")[0]
+            val res = waitEl(hands, 6000) { els -> els.firstOrNull { e -> !e.editable && e.r.top > h * 0.2 && e.r.top < h * 0.8 && low(e.label).contains(first) && !low(e.label).contains("meta ai") && !low(e.label).contains("search") } }
+            if (res == null) { fl("no chat row for $q"); return null }
+            tapEl(hands, res); Thread.sleep(900)
+            return "$q की चैट खोल दी।"
+        }
+        if (chip.isNotEmpty()) {
+            bottomTab(0)
+            val c = waitEl(hands, 5000) { els -> els.firstOrNull { e -> e.r.top > h * 0.1 && e.r.top < h * 0.35 && low(e.label).trim().startsWith(chip) } } ?: run { fl("chip $chip not found"); return null }
+            tapEl(hands, c); Thread.sleep(600)
+            return when (chip) { "unread" -> "Unread चैट्स दिखा दीं।"; "favorites" -> "Favorites दिखा दिए।"; else -> "ग्रुप्स दिखा दिए।" }
+        }
+        bottomTab(tab)
+        return when (tab) { 1 -> "Updates (स्टेटस) खोल दिए।"; 2 -> "Communities खोल दी।"; 3 -> "Calls खोल दीं।"; else -> "WhatsApp खोल दिया।" }
+    }
+
+    /** "YouTube Downloads kholo" / "YouTube Shorts kholo": straight to the tab, no AI calls. */
+    private fun ytQuick(ctx: Context, hands: Hands, jl: String): String? {
+        val named = jl.contains("youtube") || jl.contains("यूट्यूब")
+        val shortsOnly = !named && (jl.contains("shorts") || jl.contains("शॉर्ट")) && listOf("instagram", "insta", "reel", "रील", "facebook", "snap").none { jl.contains(it) }
+        if (!named && !shortsOnly) return null
+        val padded = " $jl "
+        if (listOf(" aur ", " और ", " phir ", " फिर ", " then ", " and ").any { padded.contains(it) }) return null
+        val dm = ctx.resources.displayMetrics
+        val open = listOf("khol", "खोल", "open", "dikha", "दिखा", "dekh", "देख", "chala", "चला", "play").any { jl.contains(it) }
+        if (!open) return null
+        val wantDl = jl.contains("downloads") || jl.contains("डाउनलोड्स") || jl.contains("डाउनलोडेड")
+        val wantShorts = !wantDl && (jl.contains("shorts") || jl.contains("शॉर्ट"))
+        if (!wantDl && !wantShorts) return null
+        val r = openSmart(hands, "youtube")
+        if (!r.startsWith("Opened")) return null
+        fun bottom(name: String) = waitEl(hands, 6000) { els -> els.firstOrNull { low(it.label).trim().startsWith(name) && it.r.top > dm.heightPixels * 0.8 } }
+        if (wantShorts) {
+            val t = bottom("shorts") ?: return null
+            tapEl(hands, t)
+            return "Shorts खोल दिए।"
+        }
+        val you = bottom("you") ?: return null
+        tapEl(hands, you)
+        val d = waitEl(hands, 5000) { els -> els.firstOrNull { low(it.label).trim().startsWith("downloads") } } ?: return null
+        tapEl(hands, d)
+        return "Downloads खोल दिए।"
+    }
+
+    /**
+     * Opens a search result page straight from a link (YouTube, Maps, Spotify, Amazon, Flipkart, Google),
+     * skipping the open-app / find-box / type / enter steps. Returns a note for the agent, or null.
+     */
+    /** True when the last deepOpen opened a plain search that needs nothing more (so the agent can stop at once). */
+    @Volatile private var deepPure = false
+
+    private fun deepOpen(ctx: Context, job: String): String? {
+        val jl = low(job)
+        deepPure = false
+        if (DEEP_APPS.none { jl.contains(it) }) return null
+        // fast path: a short, simple "YouTube pe X chalao" is understood here, without waiting for an AI call
+        val local = fastGuess(jl)
+        var app: String
+        var q: String
+        if (local != null) { app = local.first; q = local.second }
+        else {
+            val r = Brain.quickJson(
+                "User task for a phone agent: \"$job\"\nIf the task starts by searching or playing something in YouTube, Google Maps, Spotify, Amazon, Flipkart, Play Store or Google, " +
+                    "reply {\"app\":\"youtube|maps|spotify|amazon|flipkart|playstore|google|netflix|reddit|pinterest\",\"query\":\"only the search words, in the language a user would type\"}. " +
+                    "Otherwise reply {\"app\":\"none\",\"query\":\"\"}. JSON only.",
+                90, 8000, true
+            ) ?: return null
+            val j = try { JSONObject(r.trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()) } catch (e: Exception) { return null }
+            app = low(j.optString("app"))
+            q = j.optString("query").trim()
+        }
+        if (q.isEmpty() || app == "none") return null
+        deepPure = local != null && app in setOf("maps", "amazon", "flipkart", "google", "reddit", "pinterest", "netflix") &&
+            listOf("navigate", "navigation", "direction", "रास्ता", "rasta", "chalo", "चलो", "route", "रूट", "play", "chalao", "चलाओ", "चला", "lagao", "लगाओ", "laga", "लगा").none { jl.contains(it) }
+        val e = java.net.URLEncoder.encode(q, "UTF-8")
+        val (url, pkg) = when (app) {
+            "youtube" -> Pair("https://www.youtube.com/results?search_query=$e", "com.google.android.youtube")
+            "maps" -> Pair("https://www.google.com/maps/search/?api=1&query=$e", "com.google.android.apps.maps")
+            "spotify" -> Pair("spotify:search:$e", "com.spotify.music")
+            "amazon" -> Pair("https://www.amazon.in/s?k=$e", "in.amazon.mShop.android.shopping")
+            "flipkart" -> Pair("https://www.flipkart.com/search?q=$e", "com.flipkart.android")
+            "google" -> Pair("https://www.google.com/search?q=$e", "")
+            "playstore" -> Pair("market://search?q=$e", "com.android.vending")
+            "netflix" -> Pair("https://www.netflix.com/search?q=$e", "com.netflix.mediaclient")
+            "reddit" -> Pair("https://www.reddit.com/search/?q=$e", "com.reddit.frontpage")
+            "pinterest" -> Pair("https://www.pinterest.com/search/pins/?q=$e", "com.pinterest")
+            else -> return null
+        }
+        fun go(withPkg: Boolean): Boolean = try {
+            val i = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url))
+            i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (withPkg && pkg.isNotEmpty()) i.setPackage(pkg)
+            ctx.startActivity(i)
+            true
+        } catch (ex: Exception) { false }
+        if (!(go(true) || go(false))) return null
+        return "opened $app search results for \"$q\" directly via link (the search is ALREADY done; do not search again, continue with the rest of the task)"
+    }
+
+    // ---- learned shortcuts: a task that worked once is replayed step by step next time (the screen is checked at every step)
+
+    private fun recipeKey(job: String): String = low(job).replace(Regex("[^\\p{L}\\p{N}]+"), " ").trim()
+
+    private fun loadRecipe(job: String): org.json.JSONArray? = try {
+        JSONObject(Prefs.recipes).optJSONArray(recipeKey(job))
+    } catch (e: Exception) { null }
+
+    private fun saveRecipe(job: String, steps: List<JSONObject>) {
+        try {
+            val all = JSONObject(Prefs.recipes)
+            val arr = org.json.JSONArray()
+            steps.forEach { arr.put(it) }
+            all.put(recipeKey(job), arr)
+            // keep only the 30 newest
+            val keys = ArrayList<String>()
+            val it2 = all.keys()
+            while (it2.hasNext()) keys.add(it2.next())
+            if (keys.size > 30) for (k in keys.take(keys.size - 30)) all.remove(k)
+            Prefs.recipes = all.toString()
+        } catch (e: Exception) {}
+    }
+
+    private fun forgetRecipe(job: String) {
+        try {
+            val all = JSONObject(Prefs.recipes)
+            all.remove(recipeKey(job))
+            Prefs.recipes = all.toString()
+        } catch (e: Exception) {}
+    }
+
+    /** Replays saved steps. Stops at the first step whose button is not on screen. Returns how many steps ran. */
+    private fun replay(hands: Hands, recipe: org.json.JSONArray, history: MutableList<String>): Int {
+        var n = 0
+        for (i in 0 until recipe.length()) {
+            if (cancelled) break
+            val s = recipe.optJSONObject(i) ?: break
+            val act = s.optString("a")
+            val label = s.optString("l")
+            var obs = observe(hands) ?: break
+            if (BLOCKED_PKGS.any { obs.first.startsWith(it) }) break
+            val before = obs.first + obs.third.hashCode()
+            fun find(o: Triple<String, List<El>, String>): El? =
+                o.second.firstOrNull { it.clickable && low(it.label).trim() == low(label).trim() }
+            when (act) {
+                "tap" -> {
+                    var el = find(obs)
+                    if (el == null) { Thread.sleep(1300); obs = observe(hands) ?: break; el = find(obs) }
+                    if (el == null || el.label == "(password field)" || risky(el.label)) break
+                    history.add("replayed tap \"${label.take(30)}\" -> " + tapEl(hands, el))
+                }
+                "type", "type_enter" -> {
+                    val el = if (label.isNotBlank()) obs.second.firstOrNull { it.editable && low(it.label).trim() == low(label).trim() } else null
+                    if (el != null) { tapEl(hands, el); Thread.sleep(350) }
+                    val r = hands.typeText(s.optString("t"))
+                    if (act == "type_enter") { Thread.sleep(250); history.add("replayed typed \"${s.optString("t")}\" + enter -> $r; " + pressEnter(hands)) }
+                    else history.add("replayed typed \"${s.optString("t")}\" -> $r")
+                }
+                "open_app" -> history.add("replayed open_app -> " + openSmart(hands, s.optString("t")))
+                "scroll_down" -> history.add("replayed scroll down -> " + hands.scroll(true))
+                "scroll_up" -> history.add("replayed scroll up -> " + hands.scroll(false))
+                "back" -> history.add("replayed back -> " + hands.press("back"))
+                "enter" -> history.add("replayed enter -> " + pressEnter(hands))
+                else -> break
+            }
+            n++
+            settle(hands, before)
+        }
+        return n
+    }
+
+    private val APP_NAMES = mapOf(
+        "hotstar" to listOf("JioHotstar", "Hotstar", "Disney+ Hotstar"),
+        "jiohotstar" to listOf("JioHotstar", "Hotstar", "Disney+ Hotstar"),
+        "jio hotstar" to listOf("JioHotstar", "Hotstar", "Disney+ Hotstar"),
+        "prime video" to listOf("Prime Video", "Amazon Prime Video"),
+        "prime" to listOf("Prime Video", "Amazon Prime Video")
+    )
+
+    private fun openSmart(hands: Hands, name: String): String {
+        val names = (APP_NAMES[low(name).trim()] ?: emptyList()) + name
+        var last = ""
+        for (n in names) {
+            last = hands.openApp(n)
+            if (last.startsWith("Opened")) return last
+        }
+        return last
+    }
+
+    /** Hands over to the user (password, OTP ...) and continues by itself once they are done. Returns false on timeout / cancel. */
+    private fun waitForUser(hands: Hands, msg: String, pwd: Boolean): Boolean {
+        userReply = null
+        awaiting = "ask"
+        say(msg)
+        val begin = System.currentTimeMillis()
+        val end = begin + 5 * 60_000L
+        var sawInput = true
+        while (!cancelled && System.currentTimeMillis() < end) {
+            if (userReply != null) break
+            Thread.sleep(1000)
+            val o = observe(hands) ?: continue
+            val waited = System.currentTimeMillis() - begin
+            if (waited < 6000) continue
+            val stillPwd = o.second.any { it.label == "(password field)" }
+            val anyInput = o.second.any { it.editable }
+            if (pwd && !stillPwd) break
+            if (!pwd) {
+                if (anyInput) sawInput = true
+                if (sawInput && !anyInput) break
+            }
+        }
+        val ok = !cancelled && System.currentTimeMillis() < end
+        awaiting = null
+        userReply = null
+        return ok
+    }
+
+    private fun verifyDone(hands: Hands, job: String, history: List<String>): Pair<Boolean, String> {
+        val o = observe(hands) ?: return Pair(true, "")
+        val p = buildString {
+            append("Task given to a phone agent: \"").append(job).append("\"\n")
+            append("Current app: ").append(o.first).append("\nScreen elements:\n").append(o.third)
+            append("Progress notes: ").append(progress).append("\nRecent actions:\n"); history.takeLast(8).forEach { append("- ").append(it).append('\n') }
+            append("""
+Is the WHOLE task (every part the user asked for) REALLY completed right now, judging from the screen and the actions? A login page, home page, loading spinner, search page, error, popup, or a list where the item is not yet playing/added/opened means NOT complete. For 'play/start something' the player or live content must be visible.
+Reply ONLY JSON: {"complete":true,"why":"","next":"the concrete next action if not complete"}""")
+        }
+        // with Vision on, the checker also looks at the real picture: a video that is really playing cannot be proven from text alone
+        val hasPwd = o.second.any { it.label == "(password field)" }
+        val shot: String? = if (Vision.on && !hasPwd) Vision.grab() else null
+        val q = if (shot != null) p + "\nA screenshot of the current screen is attached; trust it for what is really visible (video playing, correct channel/title, popups)." else p
+        val r = Brain.quickJson(q, 160, if (shot != null) 18000 else 12000, true, shot) ?: return Pair(true, "")
+        return try {
+            val j = JSONObject(r.trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim())
+            Pair(j.optBoolean("complete", true), j.optString("next", j.optString("why", "")))
+        } catch (e: Exception) { Pair(true, "") }
+    }
+
+    private fun loop(ctx: Context, hands: Hands, job: String) {
+        val history = ArrayList<String>()
+        var started = System.currentTimeMillis()
+        var lastSig = ""
+        var same = 0
+        var step = 0
+        var failPush = 0
+        var doneRejects = 0
+        var mainApp = ""
+        var notInstalled = 0
+        var nullObs = 0
+        var logged = 0
+        var calm = 0
+        var hinted = false
+        val rec = ArrayList<JSONObject>()
+        var recordable = true
+        var stuckSeen = false
+        var lastAi = 0L
+        val reflexUsed = HashMap<String, Int>()
+        val seenScreens = HashMap<String, Int>()
+        val missCount = HashMap<String, Int>()
+        val loginJob = low(job).let { it.contains("login") || it.contains("log in") || it.contains("sign in") || it.contains("लॉगिन") }
+        val t00 = System.currentTimeMillis()
+        planText = ""
+        progress = ""
+        val words = job.trim().split(Regex("\\s+")).size
+        planThread = if (words < 6) null else Thread {
+            planText = Brain.quickText(
+                "A phone agent must do this task on an Android phone: \"$job\". Split it into its separate parts in the exact order the user said, then write a short numbered plan (max 8 steps, each under 10 words) including likely obstacles " +
+                    "(login with phone number + OTP, permission popups, ads, 'update app', profile pick, slow loading) and how to get past each. Plain text, no preface.",
+                260
+            ) ?: ""
+        }
+        planThread?.start()
+        // open the named app right away, no AI call needed for that
+        val jl = low(job)
+        val quick = try { ytQuick(ctx, hands, jl) } catch (ex: Exception) { null }
+        if (quick != null) { say(quick); return }
+        val igq = try { igQuick(ctx, hands, jl) } catch (ex: Exception) { null }
+        if (igq != null) { say(igq); return }
+        val waq = try { waQuick(ctx, hands, jl) } catch (ex: Exception) { null }
+        if (waq != null) { say(waq); return }
+        val ytdl = ytDownloadPlan(jl)
+        if (ytdl != null) {
+            val fast = try { ytFastDownload(ctx, hands, ytdl.first, ytdl.second, ytdl.third) } catch (ex: Exception) { null }
+            if (fast != null) { say(fast); return }
+            history.add("opened youtube search results for \"${ytdl.first}\" directly via link (the search is ALREADY done). Quick route failed: do it by hand: tap the ⋮ at the right of the first video, then 'Download video', then the 360p option, then Download.")
+        }
+        val deep = if (ytdl != null) "" else deepOpen(ctx, job)
+        if (deep != null && deep.isNotEmpty()) { history.add(deep); Thread.sleep(1800) }
+        if (deep != null && deep.isNotEmpty() && deepPure) { say("ठीक है, खोल दिया।"); return }
+        val first = if (deep != null || ytdl != null) null else APPS.firstOrNull { it.all { c -> c.code < 128 } && jl.contains(it) }
+        if (first != null) {
+            val r = openSmart(hands, first)
+            if (r.startsWith("Opened")) { mainApp = first; history.add("open_app $first -> $r"); Thread.sleep(1200) }
+        }
+        val saved = loadRecipe(job)
+        if (saved != null && saved.length() > 0) {
+            val n = replay(hands, saved, history)
+            Assistant.get(ctx).note("⚙ replayed $n of ${saved.length()} learned steps")
+            if (n > 0) progress = "the first $n steps were already done by a learned shortcut; check the screen and continue"
+            if (n < saved.length()) forgetRecipe(job)
+            recordable = false
+        }
+        if (words >= 8) try { planThread?.join(4000) } catch (e: Exception) {}
+        while (step < 90 && !cancelled) {
+            if (System.currentTimeMillis() - started > 15 * 60_000L) {
+                say("काम में बहुत देर लग गई, इसलिए रोक दिया।")
+                return
+            }
+            step++
+            val obs = observe(hands)
+            if (obs == null) {
+                nullObs++
+                Assistant.get(ctx).note("⚙ Agent: screen not readable ($nullObs)")
+                if (nullObs == 3) history.add("auto: screen unreadable, pressed back -> " + hands.press("back"))
+                if (nullObs >= 6) {
+                    say(if (hands.service == null) "Accessibility बंद हो गई है। Settings में Zyro की Accessibility एक बार बंद करके फिर चालू करो।"
+                        else "इस स्क्रीन को मैं पढ़ नहीं पा रहा, शायद फोन लॉक है या यह ऐप स्क्रीन छुपाता है। फोन अनलॉक करके फिर बोलो।")
+                    return
+                }
+                Thread.sleep(900)
+                continue
+            }
+            nullObs = 0
+            val (pkg, els, text) = obs
+            if (BLOCKED_PKGS.any { pkg.startsWith(it) }) {
+                say("यह पेमेंट या सिस्टम वाली स्क्रीन है, यहाँ मैं हाथ नहीं लगाता। बाकी आप कर लो।")
+                return
+            }
+            val sig = pkg + text.hashCode()
+            seenScreens[sig] = (seenScreens[sig] ?: 0) + 1
+            same = if (sig == lastSig) same + 1 else 0
+            lastSig = sig
+            calm = if (same == 0) calm + 1 else 0
+            if (same >= 3) stuckSeen = true
+            // automatic recovery when nothing changes
+            if (same >= 4 && same % 4 == 0) {
+                history.add("auto: screen stuck, pressed back -> " + hands.press("back"))
+                Thread.sleep(800)
+            }
+            if (same >= 9 && mainApp.isNotBlank()) {
+                history.add("auto: stuck for long, reopened $mainApp -> " + openSmart(hands, mainApp))
+                same = 0
+                Thread.sleep(1500)
+            }
+            // the agent gets a picture of the screen when text alone is not enough
+            val unlabeled = els.count { it.label.isEmpty() }
+            val hasPwd = els.any { it.label == "(password field)" }
+            val shot: String? = if (Vision.on && !hasPwd && (same >= 2 || els.size < 4 || unlabeled * 2 > els.size)) Vision.grab() else null
+            if (!Vision.on && !hinted && System.currentTimeMillis() - visionAsked > 600_000L && (same >= 3 || (els.size < 4 && step > 2))) {
+                hinted = true
+                visionAsked = System.currentTimeMillis()
+                // ask for the screen-view permission right now, so the user only has to press one button
+                say("यहाँ बिना नाम वाले बटन हैं। स्क्रीन देखने की इजाज़त वाली खिड़की खुल रही है, उसमें Start now दबा दो।")
+                try { Vision.ask(ctx) } catch (e: Exception) { }
+                val waitEnd = System.currentTimeMillis() + 12_000L
+                while (!Vision.on && !cancelled && System.currentTimeMillis() < waitEnd) Thread.sleep(500)
+                if (Vision.on) { Thread.sleep(800); continue }
+            }
+            // reflex: obvious popups are closed instantly, no AI call needed
+            val rf = els.firstOrNull { e ->
+                val l = low(e.label).trim()
+                e.clickable && l.isNotEmpty() && (l in REFLEX_ALWAYS || (!loginJob && l in REFLEX_SOFT))
+            }
+            if (rf != null) {
+                val key = pkg + rf.label
+                val n = (reflexUsed[key] ?: 0) + 1
+                reflexUsed[key] = n
+                if (n <= 2) {
+                    history.add("auto-closed popup \"${rf.label.take(30)}\" -> " + tapEl(hands, rf))
+                    while (logged < history.size) { Assistant.get(ctx).note("⚙ " + history[logged]); logged++ }
+                    settle(hands, sig)
+                    continue
+                }
+            }
+            val prompt = buildString {
+                append("You are an expert, persistent agent that operates an Android phone for the user. User's task: \"").append(job).append("\"\n")
+                append("The user speaks Hindi/English/Hinglish; the 'say' field must be in the same style, short.\n")
+                val plan = planText
+                if (plan.isNotBlank()) append("Your plan:\n").append(plan).append('\n')
+                if (progress.isNotBlank()) append("Your progress notes: ").append(progress).append('\n')
+                append("Current app package: ").append(pkg).append("\n")
+                appTips(pkg)?.let { append("Tips for this app: ").append(it).append('\n') }
+                append(Know.forTask(job, pkg))
+                append("Screen elements (id: label [tap/input]); '(no label @x,y)' means an icon at that screen position:\n").append(text.ifEmpty { "(nothing readable - maybe loading or a video; try wait, back, or tap_xy)\n" })
+                if (shot != null) append("A screenshot of the current screen is attached. Use it to see icons, video controls and anything without a label. To tap something you can see ONLY in the picture use action tap_norm with x,y between 0 and 1000 (0,0 = top-left, 1000,1000 = bottom-right).\n")
+                append("Actions done so far:\n")
+                if (history.isEmpty()) append("(none)\n") else history.takeLast(8).forEach { append("- ").append(it).append('\n') }
+                val seen = (seenScreens[sig] ?: 0)
+                if (seen >= 4) append("WARNING: you have now seen this exact screen ").append(seen).append(" times, so your current approach is NOT working. Change strategy completely: a different tab or menu, the search box, open_app again, back out to the home of the app, or tap_norm on what you see in the picture. Do not repeat any earlier action.\n")
+                if (same >= 2) append("WARNING: the screen did not change after your last actions. Do something DIFFERENT (another element, scroll, back, tap_xy on an icon).\n")
+                append("""
+Choose ONE next action and reply with ONLY JSON:
+{"thought":"short reason","progress":"parts of the task already completed / parts still remaining","action":"tap|tap_xy|tap_norm|scroll_find|type|type_enter|enter|scroll_down|scroll_up|back|home|open_app|wait|ask_user|wait_user|done|fail","id":0,"x":0,"y":0,"text":"","app":"","say":""}
+Rules:
+- scroll_find: text = words of the button/title you are looking for; scrolls down by itself (set say="up" to scroll up) until it shows on screen, then you tap it. Use this instead of many scroll_down steps. If the hint says there is no more content below, do not scroll down.
+- tap: id = element number. tap_xy: x,y screen position (for icons without label, player controls, close X). type: id = input element number (0 = focused box), text = text. type_enter: type the text then press search/enter in ONE step (use for search boxes). enter: press keyboard search/enter. open_app: app = name (do it first if the right app is not open).
+- You must FINISH the task. Obstacles are normal and YOU solve them: dismiss popups/ads/rating/update/notification dialogs (Skip, Not now, Later, Close, X, Got it, Maybe later), allow normal app permissions, choose a profile if asked, wait when loading, scroll to find things, use the search box, try another tab/menu/icon, go back and retry a different route. Never give up on the first problem. Use fail only after you truly tried many different ways, and explain exactly what blocks you.
+- Login: if the app needs login and the phone/email field is empty, use ask_user to get the phone number or email, type it, then continue. When an OTP is asked, use ask_user to get the OTP from the user (they read it from their SMS) and type it. Passwords, PINs and card details: NEVER type them; use wait_user with a short message so the user enters them, you continue automatically afterwards.
+- The task can have SEVERAL parts. Do them ALL, in the order the user said. Update "progress" every step (what is finished, what remains). Never say done while a part remains.
+- done only when the goal is really visible on screen (e.g. the match is actually playing). Put a short spoken result in say.
+- ask_user: only for facts only the user knows. Do not ask permission for normal steps.
+- Do not tap the final order/pay/send/subscribe button unless the task clearly asks for it; the app asks the user separately.
+""")
+            }
+            var reply: String? = null
+            var told = false
+            val tAi = System.currentTimeMillis()
+            for (t in 0..5) {
+                reply = Brain.quickJson(prompt, 260, 25000, calm >= 2 && t == 0 && shot == null, shot)
+                if (reply != null) break
+                val f = Brain.lastFail
+                if (f == 401 || f == 403 || f == -1) break
+                if (f == 429) {
+                    if (!told) { say("Gemini की limit कुछ सेकंड के लिए भरी है, थोड़ा रुककर आगे बढ़ता हूँ।"); told = true }
+                    Thread.sleep(7000)
+                } else Thread.sleep(1200)
+                if (cancelled) return
+            }
+            if (reply == null) {
+                val f = Brain.lastFail
+                say(when {
+                    f == -1 -> "Gemini key नहीं मिली। Settings में key डालो।"
+                    f == 401 || f == 403 -> "Gemini की key सही नहीं है या बंद है। Settings में नई key डालो।"
+                    f == 429 -> "Gemini की free limit पूरी हो गई। एक-दो मिनट बाद फिर बोलो।"
+                    f == 0 -> "इंटरनेट नहीं चल रहा। नेट चेक करो।"
+                    else -> "Gemini से जवाब नहीं आया (error $f)। थोड़ी देर बाद फिर बोलो।"
+                })
+                return
+            }
+            lastAi = System.currentTimeMillis() - tAi
+            val j = try { JSONObject(reply.trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()) } catch (e: Exception) {
+                history.add("(bad reply, retrying)")
+                calm = 0
+                continue
+            }
+            j.optString("progress", "").let { if (it.isNotBlank()) progress = it.take(300) }
+            val action = low(j.optString("action"))
+            val id = j.optInt("id", 0)
+            val txt = j.optString("text", "")
+            val sayText = j.optString("say", "")
+            val el = els.firstOrNull { it.id == id }
+            if (cancelled) break
+            when (action) {
+                "done" -> {
+                    if (doneRejects < 4) {
+                        val (ok, next) = verifyDone(hands, job, history)
+                        if (!ok) {
+                            doneRejects++
+                            history.add("NOT finished yet (check says): $next")
+                            settle(hands, sig)
+                            continue
+                        }
+                    }
+                    if (recordable && !stuckSeen && failPush == 0 && doneRejects == 0 && rec.size in 1..20) saveRecipe(job, rec)
+                    say(sayText.ifBlank { "काम हो गया।" })
+                    return
+                }
+                "fail" -> {
+                    failPush++
+                    if (failPush <= 3 && missCount.values.none { it >= 2 }) {
+                        history.add("You said fail (\"${sayText.take(60)}\") but giving up is not allowed yet. Try another route: scroll, search, other tab/menu, back, reopen the app, tap_xy.")
+                    } else {
+                        val r = askUser((sayText.ifBlank { "यहाँ अटक गया हूँ।" }) + " क्या करूँ?")
+                        if (r == null) {
+                            if (!cancelled) say(sayText.ifBlank { "मैं यह नहीं कर पाया।" })
+                            return
+                        }
+                        history.add("stuck; user guidance: $r")
+                        failPush = 0
+                    }
+                }
+                "ask_user" -> {
+                    recordable = false
+                    val t0 = System.currentTimeMillis()
+                    val r = askUser(sayText.ifBlank { "मुझे थोड़ी जानकारी चाहिए।" })
+                    started += System.currentTimeMillis() - t0
+                    if (r == null) {
+                        if (!cancelled) say("जवाब नहीं मिला, काम रोक दिया।")
+                        return
+                    }
+                    history.add("asked user, user said: $r")
+                }
+                "wait_user" -> {
+                    recordable = false
+                    val t0 = System.currentTimeMillis()
+                    val ok = waitForUser(hands, sayText.ifBlank { "यह आप खुद डाल दो, मैं यहीं इंतज़ार करता हूँ।" }, false)
+                    started += System.currentTimeMillis() - t0
+                    if (!ok) {
+                        if (!cancelled) say("काफ़ी इंतज़ार किया, काम रोक रहा हूँ।")
+                        return
+                    }
+                    history.add("user handled the screen, continuing")
+                }
+                "tap" -> {
+                    if (el == null) {
+                        history.add("tap failed: no element $id")
+                    } else {
+                        if (el.label == "(password field)") {
+                            val t0 = System.currentTimeMillis()
+                            val ok = waitForUser(hands, "पासवर्ड आप खुद डाल दो, मैं यहीं इंतज़ार करता हूँ।", true)
+                            started += System.currentTimeMillis() - t0
+                            if (!ok) { if (!cancelled) say("इंतज़ार बहुत हो गया, रुक रहा हूँ।"); return }
+                            history.add("user entered password, continuing")
+                            settle(hands, sig)
+                            continue
+                        }
+                        if (risky(el.label)) {
+                            val ok = confirm("\"" + el.label.take(40) + "\" दबाने जा रहा हूँ। पक्का? हाँ या नहीं बोलो।")
+                            if (!ok) {
+                                if (!cancelled) say("ठीक है, नहीं दबाया। काम रोक दिया।")
+                                return
+                            }
+                        }
+                        val r = tapEl(hands, el)
+                        history.add("tapped $id \"${el.label.take(40)}\" -> $r")
+                        if (el.label.isNotBlank()) rec.add(JSONObject().put("a", "tap").put("l", el.label)) else recordable = false
+                    }
+                }
+                "tap_xy" -> {
+                    val x = j.optInt("x", -1)
+                    val y = j.optInt("y", -1)
+                    if (x < 0 || y < 0) history.add("tap_xy needs x and y")
+                    else { history.add("tapped position $x,$y -> " + hands.tap(x, y)); recordable = false }
+                }
+                "scroll_find" -> {
+                    val target = low(txt).trim()
+                    if (target.isEmpty()) {
+                        history.add("scroll_find needs a text: say which button or title to look for. Look at the screen list and choose tap with an id instead.")
+                        recordable = false
+                        continue
+                    }
+                    val up = low(sayText) == "up"
+                    if (target.contains("download") || target.contains("डाउनलोड")) {
+                        // the video page may still be loading: wait up to 3 s for its button row
+                        var pw = 0
+                        while (pw < 6 && !cancelled) {
+                            val o0 = observe(hands)
+                            if (o0 != null && o0.second.any { e -> val l = low(e.label); l.startsWith("share") || l.startsWith("like") || l.startsWith("शेयर") || l.startsWith("लाइक") }) break
+                            Thread.sleep(500); pw++
+                        }
+                    }
+                    var found = false
+                    var tries = 0
+                    while (target.isNotEmpty() && tries < 10 && !cancelled) {
+                        val o = observe(hands) ?: break
+                        if (o.second.any { low(it.label).contains(target) }) { found = true; break }
+                        val s0 = o.first + o.third.hashCode()
+                        hands.scroll(!up)
+                        tries++
+                        settle(hands, s0)
+                        val o2 = observe(hands) ?: break
+                        if (o2.first + o2.third.hashCode() == s0) break // end of the list
+                    }
+                    // buttons under a video (Like, Share, Download...) sit in a row that scrolls SIDEWAYS: swipe that row
+                    if (!found && target.isNotEmpty() && !cancelled) {
+                        val sw = ctx.resources.displayMetrics.widthPixels
+                        val anchors = listOf("share", "like", "remix", "save", "शेयर", "लाइक", "सेव", "clip", "thanks")
+                        var o = observe(hands)
+                        val anchor = o?.second?.firstOrNull { e -> e.r.width() < sw / 2 && anchors.any { a -> low(e.label).startsWith(a) } }
+                        if (anchor != null) {
+                            val y = anchor.r.centerY()
+                            var k = 0
+                            while (k < 4 && !cancelled && !found) {
+                                val s0 = (o?.first ?: "") + (o?.third?.hashCode() ?: 0)
+                                hands.swipe((sw * 0.88f).toInt(), y, (sw * 0.12f).toInt(), y, 320)
+                                settle(hands, s0)
+                                o = observe(hands) ?: break
+                                if (o.second.any { e -> low(e.label).contains(target) }) found = true
+                                k++
+                                tries++
+                            }
+                        }
+                    }
+                    val seen = if (found) "" else try {
+                        (observe(hands)?.second ?: emptyList()).map { e -> e.label.trim().take(24) }.filter { it.isNotEmpty() }.distinct().take(28).joinToString(" | ")
+                    } catch (e: Exception) { "" }
+                    history.add("scroll_find \"$txt\": " + if (found) "FOUND on screen after $tries scrolls, tap it now" else "not found after $tries scrolls (end of list reached or it is not here)" + (if (seen.isNotEmpty()) ". On screen now: $seen" else ""))
+                    recordable = false
+                    // the same thing searched again and again = it is simply not there: stop honestly instead of looping
+                    if (!found && target.isNotEmpty()) {
+                        val n = (missCount[target] ?: 0) + 1
+                        missCount[target] = n
+                        if (n == 2) history.add("WARNING: \"$txt\" was not found twice. It may not exist for this item (some videos or apps do not allow it). Do NOT search for it again: use action done/fail and tell the user honestly what you saw.")
+                        if (n >= 4) {
+                            say("मुझे यहाँ \"$txt\" का बटन मिल ही नहीं रहा। शायद इस वीडियो या ऐप में यह सुविधा बंद है, कुछ वीडियो डाउनलोड नहीं होने देते। इसलिए मैं रुक रहा हूँ।")
+                            return
+                        }
+                    }
+                }
+                "tap_norm" -> {
+                    val nx = j.optDouble("x", -1.0)
+                    val ny = j.optDouble("y", -1.0)
+                    if (nx < 0 || ny < 0) history.add("tap_norm needs x and y between 0 and 1000")
+                    else if (nx < 5 && ny < 5) history.add("tap_norm 0,0 is not a real place on screen; look at the screenshot again and give real coordinates, or use another action")
+                    else {
+                        val (sw, sh) = Vision.realSize(ctx)
+                        val px = (nx / 1000.0 * sw).toInt().coerceIn(0, sw - 1)
+                        val py = (ny / 1000.0 * sh).toInt().coerceIn(0, sh - 1)
+                        history.add("tapped picture position $nx,$ny -> " + hands.tap(px, py))
+                        recordable = false
+                    }
+                }
+                "type" -> {
+                    if (el != null && el.label == "(password field)") {
+                        val t0 = System.currentTimeMillis()
+                        val ok = waitForUser(hands, "पासवर्ड आप खुद डाल दो, मैं यहीं इंतज़ार करता हूँ।", true)
+                        started += System.currentTimeMillis() - t0
+                        if (!ok) { if (!cancelled) say("इंतज़ार बहुत हो गया, रुक रहा हूँ।"); return }
+                        history.add("user entered password, continuing")
+                        settle(hands, sig)
+                        continue
+                    }
+                    if (el != null) {
+                        tapEl(hands, el)
+                        Thread.sleep(500)
+                    }
+                    val r = hands.typeText(txt)
+                    history.add("typed \"$txt\" -> $r")
+                    rec.add(JSONObject().put("a", "type").put("t", txt).put("l", el?.label ?: ""))
+                }
+                "type_enter" -> {
+                    if (el != null) { tapEl(hands, el); Thread.sleep(350) }
+                    val r1 = hands.typeText(txt)
+                    Thread.sleep(250)
+                    history.add("typed \"$txt\" -> $r1; enter -> " + pressEnter(hands))
+                    rec.add(JSONObject().put("a", "type_enter").put("t", txt).put("l", el?.label ?: ""))
+                }
+                "enter" -> { history.add("enter -> " + pressEnter(hands)); rec.add(JSONObject().put("a", "enter")) }
+                "scroll_down" -> { history.add("scroll down -> " + hands.scroll(true)); rec.add(JSONObject().put("a", "scroll_down")) }
+                "scroll_up" -> { history.add("scroll up -> " + hands.scroll(false)); rec.add(JSONObject().put("a", "scroll_up")) }
+                "back" -> { history.add("back -> " + hands.press("back")); rec.add(JSONObject().put("a", "back")) }
+                "home" -> history.add("home -> " + hands.press("home"))
+                "open_app" -> {
+                    val nm = j.optString("app", txt)
+                    val r = openSmart(hands, nm)
+                    history.add("open_app $nm -> $r")
+                    if (r.startsWith("Opened")) { if (mainApp.isBlank()) mainApp = nm; notInstalled = 0; rec.add(JSONObject().put("a", "open_app").put("t", nm)) }
+                    else {
+                        notInstalled++
+                        if (notInstalled >= 2) {
+                            say("$nm फोन में इंस्टॉल नहीं मिल रहा। Play Store से इंस्टॉल करके फिर बोलो।")
+                            return
+                        }
+                    }
+                    Thread.sleep(900)
+                }
+                "wait" -> { history.add("waited for the screen to load"); settle(hands, sig) }
+                else -> history.add("unknown action '$action'")
+            }
+            while (logged < history.size) { Assistant.get(ctx).note("⚙ " + history[logged]); logged++ }
+            Assistant.get(ctx).note("⏱ step $step: AI $lastAi ms, total ${(System.currentTimeMillis() - t00) / 1000} s${if (calm >= 2) " (fast model)" else ""}")
+            val changed = settle(hands, sig)
+            // tell the AI which actions did nothing, so it stops repeating them
+            if (!changed && action != "wait" && action != "wait_user" && action != "ask_user" && history.isNotEmpty()) {
+                val k = history.size - 1
+                if (!history[k].contains("SCREEN DID NOT CHANGE")) history[k] = history[k] + " [SCREEN DID NOT CHANGE - this did not work, try something different]"
+            }
+        }
+        if (cancelled) say("ठीक है, रुक गया।") else say("काफ़ी कोशिश की पर पूरा नहीं हुआ। बाकी आप देख लो।")
+    }
+
+    /** Waits only as long as the screen needs to change (up to ~2.2 s) instead of a fixed pause. */
+    /** Short, hand-written know-how for the apps people use most, so the AI does not have to rediscover it every time. */
+    private fun appTips(pkg: String): String? = when {
+        pkg.contains("youtube") -> "HOW TO DOWNLOAD (checked on a real phone): there is NO Download button in the row under the video (that row is: channel photo, Subscribe, Like, Dislike, Share, a sparkle icon, and a ⋯ More button). Route A, on the open video page: tap the ⋯ (More / three dots) button at the right end of that row; a sheet opens with Save, Thanks, Download, Report; tap Download. Route B, in search results, a channel page or a list: tap the ⋮ (More options) at the right of the video's title; the menu shows Play next in queue, Save to Watch later, Save to playlist, Download video, Share, Remix, Report; tap 'Download video'. Route B is faster, use it when you are on a list. Then a 'Download quality' dialog appears: choose 'Medium (360p)' (the free maximum) or 'Low (144p)'; the 720p/1080p options are YouTube Premium only, never pick them; then tap the Download button at the bottom of the dialog. If the user asked 360p pick Medium (360p). It is done when the dialog closes and a download starts; downloaded videos are listed in You tab > Downloads. Shorts cannot be downloaded (their ⋯ menu has only Description, Captions, Quality, Not interested, Don't recommend, Report): tell the user honestly. Live streams and some videos do not allow it. The player must be NOT full screen and the video must be open for Route A. Search is the magnifier at the top right; type_enter in the box; results are a vertical list, tap a video TITLE. If a 'Skip ad' / 'Skip' button shows, tap it (ads can last up to 5 s). The video plays by itself; done = the player is on screen and playing."
+        pkg.contains("hotstar") -> "After opening choose the profile if asked. Live and sports are under the Sports / Cricket / Live rows or tabs; use Search (magnifier) for a match or show name. A 'Subscribe' wall means no subscription: do not pay, tell the user. Login is by phone number + OTP: use ask_user."
+        pkg.contains("instagram") -> "Bottom bar: Home, Reels, Search, Profile. Reels are full-screen videos: swipe up (scroll_down) for the next one. Search = magnifier tab, type the name, tap the account (not the posts)."
+        pkg.contains("whatsapp") -> "Search = the box 'Ask Meta AI or Search' at the top of Chats; tap the chat row; the message box says 'Message'; send is the green arrow (label 'Send') that appears after you type; the green mic needs a long press. Tabs at the bottom: Chats, Updates, Communities, Calls. Never send unless the task says to send."
+        pkg.contains("chrome") -> "The address bar is labelled 'Search or type URL' (first tap it). Use type_enter. Web page content may not be readable: use wait, scroll_find, or the screenshot (tap_norm)."
+        pkg.contains("settings") -> "Use the search icon at the top for any setting instead of scrolling menus."
+        pkg.contains("vending") -> "Play Store: search bar at the top; the green 'Install' button on the app page; 'Open' appears when done."
+        pkg.contains("maps") -> "Search box at the top ('Search here'); after choosing a place tap 'Directions' then 'Start'."
+        pkg.contains("spotify") -> "Search tab at the bottom; type the song, tap the track, then the big green Play button."
+        pkg.contains("netflix") || pkg.contains("primevideo") || pkg.contains("amazon.avod") -> "Choose the profile first; Search icon at the top; tap the title then the Play button. A login or payment wall: ask_user for the phone/OTP, never pay."
+        pkg.contains("flipkart") || pkg.contains("amazon.mShop") -> "Search box at the top; tap a product; Add to cart. Never tap Place Order / Pay unless the user clearly asked."
+        else -> null
+    }
+
+    private fun settle(hands: Hands, before: String): Boolean {
+        val end = System.currentTimeMillis() + 2200
+        Thread.sleep(120)
+        while (System.currentTimeMillis() < end && !cancelled) {
+            val o = observe(hands)
+            if (o != null && (o.first + o.third.hashCode()) != before) {
+                Thread.sleep(140) // let the animation finish
+                return true
+            }
+            Thread.sleep(80)
+        }
+        return false
+    }
+
+    private fun tapEl(hands: Hands, el: El): String {
+        var n: AccessibilityNodeInfo? = el.node
+        var hops = 0
+        while (n != null && !n.isClickable && hops < 4) {
+            n = n.parent
+            hops++
+        }
+        if (n != null && n.isClickable && n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return "ok"
+        return hands.tap(el.r.centerX(), el.r.centerY())
+    }
+
+    private fun pressEnter(hands: Hands): String {
+        val svc = hands.service ?: return "no service"
+        val root = svc.rootInActiveWindow ?: return "no screen"
+        val f = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        if (f != null && Build.VERSION.SDK_INT >= 30) {
+            val ok = f.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+            if (ok) return "ok"
+        }
+        // older Android: press the keyboard's own Search / Enter / Go key
+        try {
+            val names = setOf("search", "enter", "go", "done", "send", "next", "खोजें", "खोज", "सर्च", "जाएं", "भेजें")
+            fun findKey(n: AccessibilityNodeInfo?, depth: Int): AccessibilityNodeInfo? {
+                if (n == null || depth > 12) return null
+                val d = (n.contentDescription?.toString() ?: n.text?.toString() ?: "").trim().lowercase()
+                if (d.isNotEmpty() && d in names) return n
+                for (i in 0 until n.childCount) {
+                    val f = findKey(n.getChild(i), depth + 1)
+                    if (f != null) return f
+                }
+                return null
+            }
+            for (w in svc.windows) {
+                if (w.type != android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD) continue
+                val key = findKey(w.root, 0) ?: continue
+                if (key.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return "ok"
+                val r = Rect()
+                key.getBoundsInScreen(r)
+                return hands.tap(r.centerX(), r.centerY())
+            }
+        } catch (e: Exception) {}
+        // the keys have no readable names: the Enter/Search key sits at the right end of the keyboard's bottom row
+        try {
+            for (w in svc.windows) {
+                if (w.type != android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD) continue
+                val r = Rect()
+                w.getBoundsInScreen(r)
+                if (r.width() > 200 && r.height() > 200) {
+                    val x = r.right - (r.width() * 0.07f).toInt()
+                    val y = r.bottom - (r.height() * 0.11f).toInt()
+                    return hands.tap(x, y)
+                }
+            }
+        } catch (e: Exception) {}
+        return "Enter key not available; tap the search suggestion or the search button instead."
+    }
+}
