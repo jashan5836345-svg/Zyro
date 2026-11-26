@@ -38,11 +38,12 @@ object Dev {
     private fun say(ctx: Context, text: String) = Assistant.get(ctx).announce(text)
     private fun log(ctx: Context, text: String) = Assistant.get(ctx).note(text)
 
-    private val SELF = """- Mic mere naam ko aksar galat sunta hai (Sid, Sayro, Zairo), isliye wake word kabhi kabhi fail hota hai. On-device wake word nahi hai.
-- Mera agent kabhi kabhi bina kaam ke phone par tap kar deta tha. Mere paas action log ya undo nahi hai.
-- Agent sirf accessibility tree padhta hai (Android 8.1 par screenshot vision nahi), kuch apps mein 'screen not readable' aata hai.
+    private val SELF = """- Mic mere naam ko aksar galat sunta hai (Sid, Sayro, Zairo). Wake word abhi sirf alias list se pakadta hai, fuzzy matching nahi hai.
+- Agent sirf accessibility tree padhta hai, kuch apps mein 'screen not readable' aata hai, aur har kaam ke baad pakka verification nahi hai.
 - Gemini Live ka pehla AI step kabhi 20+ second leta hai.
-- Mere paas trigger rules, structured memory aur deep links hain, par har kaam ke baad pakka verification nahi hai."""
+- Meri har baatcheet nayi chat mein hoti hai, isliye mujhe pichhle sessions ki diary hi yaad dilati hai (neeche)."""
+
+    private val FEATURES = """Already built, never rebuild or suggest these again: Gemini Live voice, phone Agent with scripted Instagram/WhatsApp/YouTube fast paths and deep links, Teach (learn by demonstration), automation rules (time, charger, wifi, battery, bluetooth, headphones, notification), structured memory (Mind) with smart recall, Black Box (action record and undo), Screen Co-pilot (Live sees the screen), Doctor (crash log and self fix through Claude), this Dev bridge, voiceprint, camera and screen vision, notification digest, auto-reply, personality."""
 
     private val SYSTEM = """You are the lead Android engineer talking, through a developer bridge, to the Zyro app itself. Zyro is a Hindi/Hinglish Jarvis-style voice assistant for Android (package com.zyro.app, Kotlin, programmatic UI, minSdk 26, AGP 8.5.2, Kotlin 1.9.24, only OkHttp as a dependency). Zyro speaks in first person. Its owner, Jashan, builds it from an Android phone using only the GitHub website: there is no laptop and no Android Studio, so nobody can test or fix compile errors by hand. Every change must compile on the first try, so keep changes small, careful and consistent with the existing code.
 Your job: discuss with Zyro which upgrade would be the biggest improvement next, then deliver it as code that Zyro itself commits to GitHub after the owner says yes.
@@ -51,9 +52,10 @@ Reply ONLY with these tags and nothing else:
 <ask>a question for Zyro, only if you really need an answer</ask>
 <need>repo file paths you must read first, one per line, max 4</need>
 <plan>what this upgrade changes, in plain words, max 6 lines</plan>
+<next>one line: the best upgrade to do after this one</next>
 <file path="app/src/main/...">complete content of a NEW file</file>
 <patch path="app/src/main/..."><old>exact existing text, it must appear exactly once in the file</old><new>replacement text</new></patch>
-Rules: only paths under app/src/main/ may change. Create new files for new features and change existing files only with small patches (never rewrite a big existing file). At most 10 files. Never touch keys or secrets. Do not add Gradle dependencies. If you call a function of an existing file, read that file first with <need>. One upgrade per round. If the build fails you will receive the compiler errors: fix them with new patches."""
+Rules: the first message contains a journal of earlier sessions and a list of what already exists; build on it, never repeat finished work and never suggest something already built. Only paths under app/src/main/ may change. Create new files for new features and change existing files only with small patches (never rewrite a big existing file). At most 10 files. Never touch keys or secrets. Do not add Gradle dependencies. If you call a function of an existing file, read that file first with <need>. One upgrade per round. If the build fails you will receive the compiler errors: fix them with new patches."""
 
     // ------------------------------------------------------------------ voice entry
 
@@ -119,7 +121,8 @@ Rules: only paths under app/src/main/ may change. Create new files for new featu
         if (!visible && Prefs.apiKey.isBlank()) log(ctx, "ℹ Claude API key नहीं है, इसलिए Gemini से काम चल रहा है (कम सटीक)।")
 
         val intro = "Main Zyro hoon, Jashan ka voice assistant app. Aaj hum mere agle bade upgrade par baat karenge.\n" +
-            "Owner ne kaha: \"$wish\"\n\nMeri apni dikkatein (jo main khud dekh chuka hoon):\n$SELF\n\n" +
+            "Owner ne kaha: \"$wish\"\n\nMeri apni dikkatein (jo main khud dekh chuka hoon):\n$SELF\n\n$FEATURES\n\n" +
+            "Meri diary (pichhle sessions, naya neeche):\n${journal(ctx).ifBlank { "(abhi koi purana session nahi)" }}\n\n" +
             "Last build: ${lastBuild()}\n\nMeri files:\n${repoMap()}\n\n" + (if (wish.startsWith("BUG-FIX")) "Upar ke bugs ke liye sirf chhote patches do." else "Batao, mujhe sabse bada upgrade kaun sa chahiye aur kaise karein?")
         val msgs = ArrayList<Pair<String, String>>()
         msgs.add("user" to intro)
@@ -151,7 +154,7 @@ Rules: only paths under app/src/main/ may change. Create new files for new featu
                 }
                 val names = changes.keys.joinToString(", ") { it.substringAfterLast('/') }
                 say(ctx, "Claude का प्लान तैयार है। ${r.say.ifBlank { r.plan }} ${changes.size} फाइलें बदलेंगी: $names। मैं GitHub पर डाल दूँ? हाँ या नहीं बोलो।")
-                if (!confirm()) { say(ctx, "ठीक है, कुछ नहीं बदला।"); return }
+                if (!confirm()) { addJournal(ctx, entry(r, changes.keys, "owner said no, nothing changed")); say(ctx, "ठीक है, कुछ नहीं बदला।"); return }
 
                 val head = mainHead()
                 if (head == null) { say(ctx, "main नहीं मिला।"); return }
@@ -168,7 +171,7 @@ Rules: only paths under app/src/main/ may change. Create new files for new featu
                     if (remaining.isNotEmpty()) {
                         val rn = remaining.keys.joinToString(", ") { it.substringAfterLast('/') }
                         say(ctx, "${done.size} फाइलें Chrome से गईं, ये नहीं जा पाईं: $rn। बाकी मैं API से डाल दूँ? हाँ बोलो।")
-                        if (!confirm()) { say(ctx, "ठीक है। कोड अधूरा है, इसलिए दोबारा बोलकर कोशिश करना।"); return }
+                        if (!confirm()) { addJournal(ctx, entry(r, changes.keys, "only some files reached GitHub, code may be incomplete")); say(ctx, "ठीक है। कोड अधूरा है, इसलिए दोबारा बोलकर कोशिश करना।"); return }
                     }
                 }
                 if (remaining.isNotEmpty()) {
@@ -186,9 +189,9 @@ Rules: only paths under app/src/main/ may change. Create new files for new featu
 
                 val (state, errs) = waitBuild(tip)
                 when (state) {
-                    "success" -> { say(ctx, "Build पास हो गया। अपग्रेड तैयार है, Actions से नया APK डाउनलोड करके इंस्टॉल करो।"); return }
-                    "none" -> { say(ctx, "कोड चला गया पर build शुरू नहीं हुआ। GitHub Actions खोलकर देख लो।"); return }
-                    "timeout" -> { say(ctx, "Build बहुत देर से चल रहा है। थोड़ी देर में GitHub Actions देख लो।"); return }
+                    "success" -> { addJournal(ctx, entry(r, changes.keys, "BUILD OK after $fixes failed tries")); say(ctx, "Build पास हो गया। अपग्रेड तैयार है, Actions से नया APK डाउनलोड करके इंस्टॉल करो।"); return }
+                    "none" -> { addJournal(ctx, entry(r, changes.keys, "pushed, but the build did not start")); say(ctx, "कोड चला गया पर build शुरू नहीं हुआ। GitHub Actions खोलकर देख लो।"); return }
+                    "timeout" -> { addJournal(ctx, entry(r, changes.keys, "pushed, build was still running when I stopped waiting")); say(ctx, "Build बहुत देर से चल रहा है। थोड़ी देर में GitHub Actions देख लो।"); return }
                 }
                 fixes++
                 log(ctx, "❌ Build फेल:\n$errs")
@@ -197,6 +200,7 @@ Rules: only paths under app/src/main/ may change. Create new files for new featu
                     val back = origHead
                     if (cur != null && back != null) {
                         val rb = commitAndLand(back.second, cur.first, "Zyro: rollback to the last working code")
+                        addJournal(ctx, entry(r, changes.keys, if (rb.first != null) "BUILD FAILED 3 times, ROLLED BACK to the old code" else "BUILD FAILED, rollback also failed"))
                         say(ctx, if (rb.first != null) "तीन बार कोशिश के बाद भी build नहीं बना, इसलिए पुराना चलता हुआ कोड वापस रख दिया।" else "Build नहीं बना और पुराना कोड भी वापस नहीं रख पाया: ${rb.second}। GitHub में zyro-backup branch देखो।")
                     }
                     return
@@ -425,8 +429,27 @@ Rules: only paths under app/src/main/ may change. Create new files for new featu
         return Brain.quickText(sb.toString(), 8000)
     }
 
+    // ------------------------------------------------------------------ the diary (so a new chat still knows the old work)
+
+    private fun jfile(ctx: Context) = java.io.File(ctx.applicationContext.filesDir, "devjournal.txt")
+
+    private fun journal(ctx: Context): String =
+        try { jfile(ctx).takeIf { it.exists() }?.readText()?.takeLast(4500).orEmpty() } catch (e: Exception) { "" }
+
+    private fun addJournal(ctx: Context, line: String) {
+        try {
+            val f = jfile(ctx)
+            val old = if (f.exists()) f.readText() else ""
+            val stamp = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.US).format(java.util.Date())
+            f.writeText((old + stamp + " " + line.replace("\n", " ").take(560) + "\n").takeLast(12000))
+        } catch (e: Exception) { /* the diary is optional */ }
+    }
+
+    private fun entry(r: Reply, files: Collection<String>?, result: String): String =
+        "RESULT: $result | plan: ${r.plan.replace("\n", " ").take(260)} | files: ${files?.joinToString(", ") { it.substringAfterLast('/') } ?: "-"} | next idea: ${r.next.take(160)}"
+
     private class Reply(
-        val say: String, val ask: String, val need: List<String>, val plan: String,
+        val say: String, val ask: String, val need: List<String>, val plan: String, val next: String,
         val files: Map<String, String>, val patches: List<Triple<String, String, String>>
     )
 
@@ -441,7 +464,7 @@ Rules: only paths under app/src/main/ may change. Create new files for new featu
         for (m in Regex("<patch path=\"([^\"]+)\">\\s*<old>(.*?)</old>\\s*<new>(.*?)</new>\\s*</patch>", RegexOption.DOT_MATCHES_ALL).findAll(s)) {
             patches.add(Triple(m.groupValues[1].trim(), trimNl(m.groupValues[2]), trimNl(m.groupValues[3])))
         }
-        return Reply(tag("say"), tag("ask"), need, tag("plan"), files, patches)
+        return Reply(tag("say"), tag("ask"), need, tag("plan"), tag("next"), files, patches)
     }
 
     /** Builds the final content of every changed file; returns (files, "") or (null, why not). */
