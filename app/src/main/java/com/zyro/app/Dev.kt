@@ -29,6 +29,7 @@ object Dev {
     @Volatile private var answer: Boolean? = null
     @Volatile private var lastErr = ""
     @Volatile private var stopped = false
+    @Volatile private var lastReplyText = ""
     private var owner = ""
 
     private const val REPO = "Zyro"
@@ -51,11 +52,12 @@ Reply ONLY with these tags and nothing else:
 <say>one to three short Hinglish sentences for Zyro and the owner</say>
 <ask>a question for Zyro, only if you really need an answer</ask>
 <need>repo file paths you must read first, one per line, max 4</need>
+<read path="app/src/main/..." from="120" to="200"/>exact lines of an existing file (max 250 lines each, up to 6 per reply)
 <plan>what this upgrade changes, in plain words, max 6 lines</plan>
 <next>one line: the best upgrade to do after this one</next>
 <file path="app/src/main/...">complete content of a NEW file</file>
 <patch path="app/src/main/..."><old>exact existing text, it must appear exactly once in the file</old><new>replacement text</new></patch>
-Rules: the first message contains a journal of earlier sessions and a list of what already exists; build on it, never repeat finished work and never suggest something already built. Only paths under app/src/main/ may change. Create new files for new features and change existing files only with small patches (never rewrite a big existing file). At most 10 files. Never touch keys or secrets. Do not add Gradle dependencies. If you call a function of an existing file, read that file first with <need>. One upgrade per round. If the build fails you will receive the compiler errors: fix them with new patches."""
+Rules: a file bigger than 9 KB arrives as an outline (lines like "12: fun x"): the numbers are only for finding places, never copy them into <old>; ask for the exact lines with <read> before you write a <patch>. The first message contains a journal of earlier sessions and a list of what already exists; build on it, never repeat finished work and never suggest something already built. Only paths under app/src/main/ may change. Create new files for new features and change existing files only with small patches (never rewrite a big existing file). At most 10 files. Never touch keys or secrets. Do not add Gradle dependencies. If you call a function of an existing file, read that file first with <need>. One upgrade per round. If the build fails you will receive the compiler errors: fix them with new patches."""
 
     // ------------------------------------------------------------------ voice entry
 
@@ -131,6 +133,7 @@ Rules: the first message contains a journal of earlier sessions and a list of wh
 
         var origHead: Pair<String, String>? = null
         var fixes = 0
+        var lastAsk = ""
         var rounds = 0
         while (rounds < 9) {
             rounds++
@@ -207,15 +210,26 @@ Rules: the first message contains a journal of earlier sessions and a list of wh
                 }
                 say(ctx, "Build फेल हुआ। Claude से सुधार पूछ रहा हूँ।")
                 msgs.add("user" to "Zyro: the build FAILED after your change was committed to main. Compiler errors:\n$errs\nFix this with <patch> or <file> tags. The failing code is already on main.")
-            } else if (r.need.isNotEmpty()) {
+            } else if (r.need.isNotEmpty() || r.reads.isNotEmpty()) {
+                val key = r.need.joinToString(",") + "|" + r.reads.joinToString(",") { "${it.first}:${it.second}-${it.third}" }
                 val sb = StringBuilder()
+                val sent = ArrayList<String>()
                 for (p in r.need.take(4)) {
-                    val c = fileText(p)
-                    sb.append("=== ").append(p).append(" ===\n").append(c?.take(if (visible) 25_000 else 40_000) ?: "(file not found)").append("\n\n")
-                    if (sb.length > (if (visible) 60_000 else 120_000)) break
+                    if (sb.length > 28_000) break
+                    val v = fileView(p)
+                    sb.append(v)
+                    sent.add("${p.substringAfterLast('/')} ${v.length / 1024 + 1}KB")
                 }
-                log(ctx, "📂 Zyro ने फाइलें भेजीं: ${r.need.take(4).joinToString(", ") { it.substringAfterLast('/') }}")
-                msgs.add("user" to "Zyro sends the files you asked for:\n$sb")
+                for ((p, from, to) in r.reads.take(6)) {
+                    if (sb.length > 34_000) break
+                    val v = readRange(p, from, to)
+                    sb.append(v)
+                    sent.add("${p.substringAfterLast('/')}:$from-$to")
+                }
+                if (key == lastAsk) sb.insert(0, "NOTE FROM ZYRO: these are the same files again. They ARE in this message below, please read them and answer with <patch> or <file> tags now.\n\n")
+                lastAsk = key
+                log(ctx, "📂 Zyro ने भेजा: ${sent.joinToString(", ")} (${sb.length} अक्षर)")
+                msgs.add("user" to "Zyro sends what you asked for (line numbers like 12: only help you find places, never copy them into <old>):\n\n$sb\n=== END OF FILES ===")
             } else if (r.ask.isNotBlank()) {
                 val reply = Brain.quickText("You are Zyro, an Android voice assistant app, talking to your engineer Claude. Answer his question in at most 3 short Hinglish sentences, honestly, using only these facts about yourself:\n$SELF\nQuestion: ${r.ask}", 300)
                     ?: "Mujhe iska jawab pata nahi, tum apne hisaab se sabse surakshit raasta chuno."
@@ -288,9 +302,79 @@ Rules: the first message contains a journal of earlier sessions and a list of wh
 
     private fun hasInput(hands: Hands): Boolean = editorNode(hands) != null
 
+    /** The Send worked when the Stop button shows up or the message box is empty again. */
+    private fun sendWorked(hands: Hands): Boolean {
+        if (buttonFor(hands, "Stop response", "Stop generating", "Stop") != null) return true
+        val ed = editorNode(hands) ?: return true
+        return (ed.text?.length ?: 0) < 40
+    }
+
+    /** The clickable button furthest to the right in the bottom row of the screen (in the Claude app this is the round Send button). */
+    private fun bottomRightButton(hands: Hands): AccessibilityNodeInfo? {
+        val svc = hands.service ?: return null
+        val dm = svc.resources.displayMetrics
+        val root = (try { hands.service?.rootInActiveWindow } catch (e: Exception) { null }) ?: return null
+        var best: AccessibilityNodeInfo? = null
+        var bestX = -1
+        fun walk(n: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 30) return
+            if (n.isVisibleToUser && n.isClickable && !n.isEditable) {
+                val r = android.graphics.Rect()
+                n.getBoundsInScreen(r)
+                if (r.centerY() > dm.heightPixels * 0.82f && r.centerX() > dm.widthPixels * 0.6f &&
+                    r.width() < dm.widthPixels / 3 && r.centerX() > bestX) {
+                    best = n
+                    bestX = r.centerX()
+                }
+            }
+            for (i in 0 until n.childCount) {
+                val c = n.getChild(i) ?: continue
+                walk(c, depth + 1)
+            }
+        }
+        walk(root, 0)
+        return best
+    }
+
+    /** Last resort: tap where the round Send button sits (bottom right of the message row). */
+    private fun tapSendGuess(hands: Hands): Boolean {
+        val svc = hands.service ?: return false
+        val dm = svc.resources.displayMetrics
+        val r = android.graphics.Rect()
+        var y = (dm.heightPixels * 0.94f).toInt()
+        val ed = editorNode(hands)
+        if (ed != null) {
+            ed.getBoundsInScreen(r)
+            if (r.height() < 220 && r.centerY() > dm.heightPixels / 2) y = r.centerY()
+        }
+        val x = (dm.widthPixels * 0.885f).toInt()
+        val res = hands.tap(x, y)
+        return res.isNotBlank() && !res.startsWith("Invalid")
+    }
+
+    /** The visible buttons and boxes, for the log when something cannot be found (so the next fix knows the real names). */
+    private fun screenLabels(hands: Hands): String {
+        val out = ArrayList<String>()
+        val root = (try { hands.service?.rootInActiveWindow } catch (e: Exception) { null }) ?: return "(स्क्रीन पढ़ नहीं पाया)"
+        fun walk(n: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 30 || out.size >= 16) return
+            if (n.isVisibleToUser && (n.isClickable || n.isEditable)) {
+                val l = labelOf(n)
+                out.add(if (l.isEmpty()) "[" + (n.className?.toString() ?: "?").substringAfterLast('.') + "]" else l.take(24))
+            }
+            for (i in 0 until n.childCount) {
+                val c = n.getChild(i) ?: continue
+                walk(c, depth + 1)
+            }
+        }
+        walk(root, 0)
+        return out.joinToString(" | ")
+    }
+
     /** Types [text] into the Claude app, sends it, waits for the answer and copies it with the app's own Copy button. */
     private fun visibleAsk(ctx: Context, hands: Hands, text: String, firstTurn: Boolean): String? {
         if (firstTurn) {
+            lastReplyText = ""
             val r = hands.openApp("Claude")
             if (!r.startsWith("Opened")) hands.openUri("https://claude.ai/new")
             waitUntil(8000) { hasInput(hands) }
@@ -299,12 +383,35 @@ Rules: the first message contains a journal of earlier sessions and a list of wh
                 waitUntil(3000) { hasInput(hands) }
             }
         }
-        var typed = hands.typeText(text)
-        if (!typed.startsWith("Typed")) { waitUntil(4000) { hasInput(hands) }; typed = hands.typeText(text) }
-        if (!typed.startsWith("Typed")) { lastErr = "(मैसेज बॉक्स में नहीं लिख पाया: $typed)"; return null }
+        var typed = ""
+        for (attempt in 0 until 3) {
+            if (!hasInput(hands)) {
+                if (attempt == 1) hands.press("back")
+                if (attempt == 2) { hands.openApp("Claude"); Thread.sleep(1200); pressButton(hands, "New chat") }
+                waitUntil(4000) { hasInput(hands) }
+            }
+            typed = hands.typeText(text)
+            if (typed.startsWith("Typed")) break
+            Thread.sleep(700)
+        }
+        if (!typed.startsWith("Typed")) { lastErr = "(मैसेज बॉक्स में नहीं लिख पाया: $typed। स्क्रीन पर: ${screenLabels(hands)})"; return null }
         // the Send button appears as soon as the box has text
-        waitUntil(3000) { buttonFor(hands, "Send message", "Send") != null }
-        if (!pressButton(hands, "Send message", "Send")) { lastErr = "(Send बटन नहीं मिला)"; return null }
+        waitUntil(3500) { buttonFor(hands, "Send message", "Send") != null }
+        var pressed = pressButton(hands, "Send message", "Send")
+        if (!pressed) {
+            // the Send button has another name in this app: take the round button at the right end of the bottom row
+            val b = bottomRightButton(hands)
+            if (b != null) {
+                log(ctx, "ℹ Send बटन का नाम नहीं मिला, नीचे दाएँ वाला बटन दबा रहा हूँ: '${labelOf(b)}'")
+                pressed = pressNode(hands, b)
+            }
+        }
+        var gone = pressed && waitUntil(6000) { sendWorked(hands) }
+        if (!gone) {
+            tapSendGuess(hands)
+            gone = waitUntil(6000) { sendWorked(hands) }
+        }
+        if (!gone) { lastErr = "(Send नहीं हो पाया। स्क्रीन पर: ${screenLabels(hands)})"; return null }
         // the answer is ready when the Stop button is gone and a Copy button is on screen
         var sawStop = false
         var calm = 0
@@ -325,8 +432,9 @@ Rules: the first message contains a journal of earlier sessions and a list of wh
             if (clickLowest(hands, "Copy")) {
                 waitUntil(2000, 150L) { clipText(ctx).isNotEmpty() }
                 val t = clipText(ctx)
-                if (listOf("<say>", "<file", "<patch", "<plan>", "<need>", "<ask>").any { t.contains(it) }) return t
-                if (t.length > 20) return "<say>" + t.take(500) + "</say>"
+                if (t.isNotEmpty() && t == lastReplyText) { Thread.sleep(700); continue }
+                if (listOf("<say>", "<file", "<patch", "<plan>", "<need>", "<ask>", "<read").any { t.contains(it) }) { lastReplyText = t; return t }
+                if (t.length > 20) { lastReplyText = t; return "<say>" + t.take(500) + "</say>" }
             }
             if (k == 1) hands.scroll(true)
             Thread.sleep(700)
@@ -448,9 +556,40 @@ Rules: the first message contains a journal of earlier sessions and a list of wh
     private fun entry(r: Reply, files: Collection<String>?, result: String): String =
         "RESULT: $result | plan: ${r.plan.replace("\n", " ").take(260)} | files: ${files?.joinToString(", ") { it.substringAfterLast('/') } ?: "-"} | next idea: ${r.next.take(160)}"
 
+    /** A file for Claude: small files in full, big ones as an outline (so the message stays small and Claude asks for exact lines). */
+    private fun fileView(path: String): String {
+        val c = fileText(path) ?: return "=== $path ===\n(file not found in the repo)\n\n"
+        val lines = c.split("\n")
+        if (c.length <= 9000) return "=== $path (${lines.size} lines, full text) ===\n$c\n\n"
+        val sb = StringBuilder("=== $path (${lines.size} lines, ${c.length / 1024} KB, outline only: ask with <read path=\"...\" from=\"N\" to=\"M\"/> for exact lines) ===\n")
+        for (i in 0 until minOf(30, lines.size)) sb.append(i + 1).append(": ").append(lines[i].take(160)).append('\n')
+        sb.append("... declarations further down ...\n")
+        var n = 0
+        for (i in 30 until lines.size) {
+            val s = lines[i].trim()
+            if (s.startsWith("fun ") || s.startsWith("private fun ") || s.startsWith("internal fun ") || s.startsWith("override fun ") ||
+                s.startsWith("class ") || s.startsWith("object ") || s.startsWith("private val ") || s.startsWith("val ") ||
+                s.startsWith("var ") || s.startsWith("private var ") || s.startsWith("@Volatile")) {
+                sb.append(i + 1).append(": ").append(lines[i].take(160)).append('\n')
+                if (++n >= 140) break
+            }
+        }
+        return sb.append('\n').toString()
+    }
+
+    private fun readRange(path: String, from: Int, to: Int): String {
+        val c = fileText(path) ?: return "=== $path ===\n(file not found in the repo)\n\n"
+        val lines = c.split("\n")
+        val a = maxOf(1, from)
+        val b = minOf(lines.size, maxOf(a, minOf(to, a + 249)))
+        if (a > lines.size) return "=== $path ===\n(the file has only ${lines.size} lines)\n\n"
+        return "=== $path lines $a-$b of ${lines.size} (raw text, no line numbers) ===\n" + lines.subList(a - 1, b).joinToString("\n") + "\n\n"
+    }
+
     private class Reply(
         val say: String, val ask: String, val need: List<String>, val plan: String, val next: String,
-        val files: Map<String, String>, val patches: List<Triple<String, String, String>>
+        val files: Map<String, String>, val patches: List<Triple<String, String, String>>,
+        val reads: List<Triple<String, Int, Int>>
     )
 
     private fun trimNl(s: String) = s.removePrefix("\r\n").removePrefix("\n").removeSuffix("\n").removeSuffix("\r")
@@ -464,7 +603,13 @@ Rules: the first message contains a journal of earlier sessions and a list of wh
         for (m in Regex("<patch path=\"([^\"]+)\">\\s*<old>(.*?)</old>\\s*<new>(.*?)</new>\\s*</patch>", RegexOption.DOT_MATCHES_ALL).findAll(s)) {
             patches.add(Triple(m.groupValues[1].trim(), trimNl(m.groupValues[2]), trimNl(m.groupValues[3])))
         }
-        return Reply(tag("say"), tag("ask"), need, tag("plan"), tag("next"), files, patches)
+        val reads = ArrayList<Triple<String, Int, Int>>()
+        for (m in Regex("<read path=\"([^\"]+)\" from=\"(\\d+)\" to=\"(\\d+)\"\\s*/>").findAll(s)) {
+            val f = m.groupValues[2].toIntOrNull()
+            val t = m.groupValues[3].toIntOrNull()
+            if (f != null && t != null) reads.add(Triple(m.groupValues[1].trim(), f, t))
+        }
+        return Reply(tag("say"), tag("ask"), need, tag("plan"), tag("next"), files, patches, reads)
     }
 
     /** Builds the final content of every changed file; returns (files, "") or (null, why not). */
