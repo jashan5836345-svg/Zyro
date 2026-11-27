@@ -134,7 +134,9 @@ object Know {
         if (pkg.contains("google.android.youtube")) {
             sb.append(YT_MAP).append('\n')
             for ((keys, text) in YT_FLOWS) if (keys.any { t.contains(it) }) sb.append(text).append('\n')
+            sb.append(YouTubeSkills.forTask(t)).append('\n')
         }
+        if (pkg.contains("youtube.creator")) sb.append(YouTubeSkills.studio(t)).append('\n')
         if (pkg.contains("instagram")) {
             sb.append(IG_MAP).append('\n')
             for ((keys, text) in IG_FLOWS) if (keys.any { t.contains(it) }) sb.append(text).append('\n')
