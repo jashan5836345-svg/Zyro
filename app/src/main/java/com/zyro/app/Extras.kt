@@ -101,6 +101,8 @@ object Extras {
         Setup.handle(ctx, t)?.let { return it }
         Github.handle(ctx, t, raw)?.let { return it }
         Mind.handle(t)?.let { return it }
+        WakeFuzzy.handle(ctx, t)?.let { return it }
+        KeyGuru.handle(ctx, t)?.let { return it }
         Wow.handle(ctx, hands, t, raw)?.let { return it }
         Teach.handle(ctx, hands, t, raw)?.let { return it }
         Genie.handle(ctx, hands, t, raw)?.let { return it }

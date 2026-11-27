@@ -539,15 +539,28 @@ class Assistant private constructor(private val app: Context) {
         var text = heardText
         if (Prefs.wakeWord && System.currentTimeMillis() > awakeUntil) {
             val low = text.lowercase(Locale.getDefault())
+            var at = -1
+            var wlen = 0
             val w = wakeWords().firstOrNull { low.contains(it) }
-            if (w == null) {
+            if (w != null) {
+                at = low.indexOf(w)
+                wlen = w.length
+            } else {
+                // the microphone may spell the name oddly (Sayro, Cairo, ज़ायरो ...): match by sound
+                val f = WakeFuzzy.find(app, text)
+                if (f != null) {
+                    at = f.first
+                    wlen = f.second - f.first
+                    log("👂 '${text.substring(f.first, f.second)}' को मेरा नाम समझा")
+                }
+            }
+            if (at < 0) {
                 relisten(250) // not for Zyro - ignore silently
                 return
             }
             if (Prefs.autoWake && !Gestures.pocketActive()) Daily.wakeScreen(app)
             // drop "hey micro" and keep the rest as the command
-            val at = low.indexOf(w)
-            var rest = (text.substring(0, at) + " " + text.substring(at + w.length)).trim()
+            var rest = (text.substring(0, at) + " " + text.substring(at + wlen)).trim()
             rest = rest.replace(Regex("(?i)^(hey|hi|hello|ok|okay|अरे|ओए|हे|हेलो|हैलो)\\s+"), "").trim()
             if (rest.isBlank()) {
                 awakeUntil = System.currentTimeMillis() + 25_000
