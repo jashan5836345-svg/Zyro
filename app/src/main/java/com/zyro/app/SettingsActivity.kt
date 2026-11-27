@@ -223,6 +223,7 @@ class SettingsActivity : Activity() {
         })
 
         box.addView(label("Free Gemini key (BEST free brain) - get it at aistudio.google.com"))
+        box.addView(button("Key कैसे बनाएँ? (आसान गाइड)", filled = true) { startActivity(Intent(this, KeyGuruActivity::class.java)) })
         geminiKey = field("paste Gemini key here (extra keys: separate with a comma)", secret = true, value = Prefs.geminiKeysRaw)
         box.addView(geminiKey)
 
