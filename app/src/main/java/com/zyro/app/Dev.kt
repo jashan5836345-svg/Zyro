@@ -309,6 +309,73 @@ Rules: a file bigger than 9 KB arrives as an outline (lines like "12: fun x"): t
         return (ed.text?.length ?: 0) < 40
     }
 
+    /**
+     * Self-healing: when a scripted step cannot find its button, the phone Agent (AI plus screen vision) does just that one step.
+     * Returns true when the Agent finished without being stopped.
+     */
+    private fun agentStep(ctx: Context, hands: Hands, job: String, ms: Long = 90_000L): Boolean {
+        if (Agent.running) return false
+        log(ctx, "🤖 बटन नहीं मिला, एजेंट (AI + स्क्रीन देखकर) से कह रहा हूँ: ${job.take(90)}")
+        val s = Agent.start(ctx, hands, job)
+        if (!Agent.running) { log(ctx, "⚠ एजेंट शुरू नहीं हुआ: $s"); return false }
+        val end = System.currentTimeMillis() + ms
+        while (Agent.running && !stopped && System.currentTimeMillis() < end) Thread.sleep(500)
+        if (Agent.running) Agent.cancel()
+        return !Agent.wasCancelled
+    }
+
+    private fun isFreshChat(hands: Hands): Boolean = buttonFor(hands, "Copy") == null
+
+    /** The "new chat" pencil icon in the top bar: the second clickable icon from the right (the last one is the menu). */
+    private fun topBarCompose(hands: Hands): AccessibilityNodeInfo? {
+        val svc = hands.service ?: return null
+        val dm = svc.resources.displayMetrics
+        val root = (try { hands.service?.rootInActiveWindow } catch (e: Exception) { null }) ?: return null
+        val found = ArrayList<AccessibilityNodeInfo>()
+        fun walk(n: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 30) return
+            if (n.isVisibleToUser && n.isClickable && !n.isEditable) {
+                val r = android.graphics.Rect()
+                n.getBoundsInScreen(r)
+                if (r.centerY() < dm.heightPixels * 0.16f && r.width() < dm.widthPixels / 4) found.add(n)
+            }
+            for (i in 0 until n.childCount) {
+                val c = n.getChild(i) ?: continue
+                walk(c, depth + 1)
+            }
+        }
+        walk(root, 0)
+        val sorted = found.sortedBy { x -> val r = android.graphics.Rect(); x.getBoundsInScreen(r); r.centerX() }
+        return if (sorted.size >= 2) sorted[sorted.size - 2] else null
+    }
+
+    /** The clickable button furthest to the right of the message box, on its row (in the Claude app: the round orange Send arrow). */
+    private fun buttonRightOfEditor(hands: Hands): AccessibilityNodeInfo? {
+        val ed = editorNode(hands) ?: return null
+        val er = android.graphics.Rect()
+        ed.getBoundsInScreen(er)
+        val root = (try { hands.service?.rootInActiveWindow } catch (e: Exception) { null }) ?: return null
+        var best: AccessibilityNodeInfo? = null
+        var bestX = -1
+        fun walk(n: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 30) return
+            if (n.isVisibleToUser && n.isClickable && !n.isEditable) {
+                val r = android.graphics.Rect()
+                n.getBoundsInScreen(r)
+                if (r.centerX() > er.right - 10 && r.centerY() >= er.top - 60 && r.centerY() <= er.bottom + 220 && r.centerX() > bestX) {
+                    best = n
+                    bestX = r.centerX()
+                }
+            }
+            for (i in 0 until n.childCount) {
+                val c = n.getChild(i) ?: continue
+                walk(c, depth + 1)
+            }
+        }
+        walk(root, 0)
+        return best
+    }
+
     /** The clickable button furthest to the right in the bottom row of the screen (in the Claude app this is the round Send button). */
     private fun bottomRightButton(hands: Hands): AccessibilityNodeInfo? {
         val svc = hands.service ?: return null
@@ -375,13 +442,35 @@ Rules: a file bigger than 9 KB arrives as an outline (lines like "12: fun x"): t
     private fun visibleAsk(ctx: Context, hands: Hands, text: String, firstTurn: Boolean): String? {
         if (firstTurn) {
             lastReplyText = ""
-            val r = hands.openApp("Claude")
-            if (!r.startsWith("Opened")) hands.openUri("https://claude.ai/new")
-            waitUntil(8000) { hasInput(hands) }
-            if (pressButton(hands, "New chat")) {
-                Thread.sleep(400)
-                waitUntil(3000) { hasInput(hands) }
+            var opened = false
+            try {
+                hands.openActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://claude.ai/new")).setPackage("com.anthropic.claude"))
+                opened = true
+            } catch (e: Exception) { /* the app does not take this link */ }
+            if (!opened) {
+                val r = hands.openApp("Claude")
+                if (!r.startsWith("Opened")) hands.openUri("https://claude.ai/new")
             }
+            Thread.sleep(1500)
+            waitUntil(8000) { hasInput(hands) }
+            // a new chat has no Copy buttons; if there are some, we are inside an old chat: open a new one
+            var fresh = isFreshChat(hands)
+            var tries = 0
+            while (!fresh && tries < 3 && !stopped) {
+                tries++
+                val b = buttonFor(hands, "New chat", "New conversation")
+                val top = if (b == null) topBarCompose(hands) else null
+                if (b != null) pressNode(hands, b) else if (top != null) pressNode(hands, top)
+                Thread.sleep(900)
+                waitUntil(3000) { hasInput(hands) }
+                fresh = isFreshChat(hands)
+            }
+            if (!fresh && !stopped) {
+                agentStep(ctx, hands, "Claude app mein ek naya khaali chat kholo: upar ke bar mein naya-chat (pencil) icon ya New chat dabao. Kuch type mat karo aur purani chat mein kuch mat badlo.")
+                waitUntil(4000) { hasInput(hands) }
+                fresh = isFreshChat(hands)
+            }
+            if (!fresh) { lastErr = "(नई चैट नहीं खुली, इसलिए पुरानी चैट में नहीं लिखूँगा। स्क्रीन पर: ${screenLabels(hands)})"; return null }
         }
         var typed = ""
         for (attempt in 0 until 3) {
@@ -394,13 +483,17 @@ Rules: a file bigger than 9 KB arrives as an outline (lines like "12: fun x"): t
             if (typed.startsWith("Typed")) break
             Thread.sleep(700)
         }
+        if (!typed.startsWith("Typed") && !stopped) {
+            agentStep(ctx, hands, "Claude app mein neeche message likhne wale box par ek baar tap karo, taaki cursor aa jaye. Kuch type mat karo.", 60_000L)
+            typed = hands.typeText(text)
+        }
         if (!typed.startsWith("Typed")) { lastErr = "(मैसेज बॉक्स में नहीं लिख पाया: $typed। स्क्रीन पर: ${screenLabels(hands)})"; return null }
         // the Send button appears as soon as the box has text
         waitUntil(3500) { buttonFor(hands, "Send message", "Send") != null }
         var pressed = pressButton(hands, "Send message", "Send")
         if (!pressed) {
-            // the Send button has another name in this app: take the round button at the right end of the bottom row
-            val b = bottomRightButton(hands)
+            // the Send button has another name in this app: take the round arrow button right of the message box
+            val b = buttonRightOfEditor(hands) ?: bottomRightButton(hands)
             if (b != null) {
                 log(ctx, "ℹ Send बटन का नाम नहीं मिला, नीचे दाएँ वाला बटन दबा रहा हूँ: '${labelOf(b)}'")
                 pressed = pressNode(hands, b)
@@ -410,6 +503,10 @@ Rules: a file bigger than 9 KB arrives as an outline (lines like "12: fun x"): t
         if (!gone) {
             tapSendGuess(hands)
             gone = waitUntil(6000) { sendWorked(hands) }
+        }
+        if (!gone && !stopped) {
+            agentStep(ctx, hands, "Claude app ke message box ke daayein taraf narangi gol button (safed upar-teer wala) dabao taaki message send ho jaye. Kuch type mat karo.")
+            gone = waitUntil(8000) { sendWorked(hands) }
         }
         if (!gone) { lastErr = "(Send नहीं हो पाया। स्क्रीन पर: ${screenLabels(hands)})"; return null }
         // the answer is ready when the Stop button is gone and a Copy button is on screen
@@ -438,6 +535,16 @@ Rules: a file bigger than 9 KB arrives as an outline (lines like "12: fun x"): t
             }
             if (k == 1) hands.scroll(true)
             Thread.sleep(700)
+        }
+        if (!stopped) {
+            try { cm.setPrimaryClip(ClipData.newPlainText("zyro", "")) } catch (e: Exception) { /* ignore */ }
+            agentStep(ctx, hands, "Claude ke sabse naye jawab ke neeche Copy icon (do kaagaz wala) ek baar dabao. Kuch aur mat karo.")
+            Thread.sleep(600)
+            val t = clipText(ctx)
+            if (t.isNotEmpty() && t != lastReplyText) {
+                lastReplyText = t
+                return if (listOf("<say>", "<file", "<patch", "<plan>", "<need>", "<ask>", "<read").any { t.contains(it) }) t else "<say>" + t.take(500) + "</say>"
+            }
         }
         lastErr = "(Copy से जवाब नहीं मिला)"
         return null
