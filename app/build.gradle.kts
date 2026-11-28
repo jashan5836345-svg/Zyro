@@ -16,6 +16,8 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+        // keep the app small: only phone CPUs (64-bit and 32-bit ARM)
+        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
 
     compileOptions {
@@ -28,6 +30,9 @@ android {
 dependencies {
     implementation("com.google.mediapipe:tasks-vision:0.10.14")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // offline speech recognition (Vosk)
+    implementation("net.java.dev.jna:jna:5.13.0@aar")
+    implementation("com.alphacephei:vosk-android:0.3.47")
 }
 
 // the hand model is downloaded once at build time and bundled into the app
