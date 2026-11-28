@@ -145,6 +145,7 @@ object Know {
         if (pkg.contains("whatsapp")) {
             sb.append(WA_MAP).append('\n')
             for ((keys, text) in WA_FLOWS) if (keys.any { t.contains(it) }) sb.append(text).append('\n')
+            sb.append(WhatsAppSkills.forTask(t)).append('\n')
         }
         return sb.toString().take(13500)
     }
