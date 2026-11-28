@@ -140,6 +140,7 @@ object Know {
         if (pkg.contains("instagram")) {
             sb.append(IG_MAP).append('\n')
             for ((keys, text) in IG_FLOWS) if (keys.any { t.contains(it) }) sb.append(text).append('\n')
+            sb.append(InstagramSkills.forTask(t)).append('\n')
         }
         if (pkg.contains("whatsapp")) {
             sb.append(WA_MAP).append('\n')
