@@ -108,6 +108,7 @@ object Extras {
         Genie.handle(ctx, hands, t, raw)?.let { return it }
         Forge.handle(ctx, hands, t, raw)?.let { return it }
         AirControl.handle(ctx, hands, t)?.let { return it }
+        IgLink.handle(ctx, hands, raw)?.let { return it }
         Agent.handle(hands, t, words, raw)?.let { return it }
         Live.handle(hands, t, words, raw)?.let { return it }
         Genius.handle(hands, t, words, raw)?.let { return it }
