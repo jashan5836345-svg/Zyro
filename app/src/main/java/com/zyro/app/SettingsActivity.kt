@@ -190,6 +190,15 @@ class SettingsActivity : Activity() {
         box.addView(option("Shake the phone twice to toggle the torch", Prefs.shakeTorch) { Prefs.shakeTorch = it })
         box.addView(option("Face down = Zyro stays quiet and collects messages", Prefs.faceDownQuiet) { Prefs.faceDownQuiet = it })
         box.addView(option("Pocket mode: read new messages aloud, do not wake the screen", Prefs.pocketMode) { Prefs.pocketMode = it })
+        box.addView(option("Offline voice: understand me without internet (one-time 42 MB download on Wi-Fi)", Prefs.offlineStt) { on ->
+            Prefs.offlineStt = on
+            if (on && !OfflineStt.ready(this)) {
+                Toast.makeText(this, "Downloading the offline voice model (about 42 MB)...", Toast.LENGTH_LONG).show()
+                ModelStore.downloadVosk(this,
+                    { msg -> runOnUiThread { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() } },
+                    { ok, msg -> runOnUiThread { if (!ok) Prefs.offlineStt = false; Toast.makeText(this, msg, Toast.LENGTH_LONG).show() } })
+            }
+        })
 
         box.addView(label("SMART TV (Android TV / Aiwa) - optional", 15f))
         box.addView(label("Turn the TV on and connect it to this phone's hotspot (or the same Wi-Fi)."))
@@ -223,7 +232,6 @@ class SettingsActivity : Activity() {
         })
 
         box.addView(label("Free Gemini key (BEST free brain) - get it at aistudio.google.com"))
-        box.addView(button("Key कैसे बनाएँ? (आसान गाइड)", filled = true) { startActivity(Intent(this, KeyGuruActivity::class.java)) })
         geminiKey = field("paste Gemini key here (extra keys: separate with a comma)", secret = true, value = Prefs.geminiKeysRaw)
         box.addView(geminiKey)
 

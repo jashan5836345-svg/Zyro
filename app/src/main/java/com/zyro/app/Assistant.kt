@@ -111,6 +111,7 @@ class Assistant private constructor(private val app: Context) {
             if (on) {
                 generation++
                 recognizer?.cancel()
+                OfflineStt.cancel()
                 stopBarge()
                 voice.stop()
                 state("Live…", OrbView.SPEAK)
@@ -142,6 +143,7 @@ class Assistant private constructor(private val app: Context) {
             if (!active || mode != OrbView.LISTEN) return
             generation++
             recognizer?.cancel()
+            OfflineStt.cancel()
             val msg = if (Prefs.jarvisMode) "सर, बैटरी कम हो रही है। चार्जर लगा लीजिए।" else "अरे, बैटरी कम हो रही है, चार्जर लगा लो!"
             log("${Prefs.friendName}: $msg")
             state("Speaking…", OrbView.SPEAK)
@@ -172,6 +174,7 @@ class Assistant private constructor(private val app: Context) {
                 val msg = Comms.incomingCallText(lastRingNumber) ?: return@postDelayed
                 generation++
                 recognizer?.cancel()
+                OfflineStt.cancel()
                 awakeUntil = System.currentTimeMillis() + 25_000
                 log("${Prefs.friendName}: $msg")
                 state("Speaking…", OrbView.SPEAK)
@@ -195,6 +198,7 @@ class Assistant private constructor(private val app: Context) {
                 if (q != null) {
                     generation++
                     recognizer?.cancel()
+                    OfflineStt.cancel()
                     awakeUntil = System.currentTimeMillis() + 25_000
                     log("${Prefs.friendName}: $q")
                     state("Speaking…", OrbView.SPEAK)
@@ -229,6 +233,7 @@ class Assistant private constructor(private val app: Context) {
                 if (m != null) {
                     generation++
                     recognizer?.cancel()
+                    OfflineStt.cancel()
                     awakeUntil = System.currentTimeMillis() + 25_000
                     log("${Prefs.friendName}: $m")
                     state("Speaking…", OrbView.SPEAK)
@@ -323,6 +328,7 @@ class Assistant private constructor(private val app: Context) {
             active = false
             generation++
             recognizer?.cancel()
+            OfflineStt.cancel()
             recognizer?.destroy()
             recognizer = null
             stopBarge()
@@ -340,6 +346,16 @@ class Assistant private constructor(private val app: Context) {
         if (app.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             log("Please allow the microphone first.")
             stopConversation()
+            return
+        }
+        if (Prefs.offlineStt && OfflineStt.ready(app)) {
+            recognizer?.destroy()
+            recognizer = null
+            state("Listening...", OrbView.LISTEN)
+            OfflineStt.listenOnce(app,
+                onText = { text -> main.post { if (active) { failures = 0; heard(text.trim()) } } },
+                onNothing = { main.post { relisten(50) } },
+                onError = { msg -> main.post { log(msg); Prefs.offlineStt = false; relisten(300) } })
             return
         }
         if (!SpeechRecognizer.isRecognitionAvailable(app)) {
@@ -381,6 +397,7 @@ class Assistant private constructor(private val app: Context) {
         if (!active) return
         generation++
         recognizer?.cancel()
+        OfflineStt.cancel()
         try {
             val am = app.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
             savedVol = am.getStreamVolume(android.media.AudioManager.STREAM_MUSIC)
@@ -539,28 +556,15 @@ class Assistant private constructor(private val app: Context) {
         var text = heardText
         if (Prefs.wakeWord && System.currentTimeMillis() > awakeUntil) {
             val low = text.lowercase(Locale.getDefault())
-            var at = -1
-            var wlen = 0
             val w = wakeWords().firstOrNull { low.contains(it) }
-            if (w != null) {
-                at = low.indexOf(w)
-                wlen = w.length
-            } else {
-                // the microphone may spell the name oddly (Sayro, Cairo, ज़ायरो ...): match by sound
-                val f = WakeFuzzy.find(app, text)
-                if (f != null) {
-                    at = f.first
-                    wlen = f.second - f.first
-                    log("👂 '${text.substring(f.first, f.second)}' को मेरा नाम समझा")
-                }
-            }
-            if (at < 0) {
+            if (w == null) {
                 relisten(250) // not for Zyro - ignore silently
                 return
             }
             if (Prefs.autoWake && !Gestures.pocketActive()) Daily.wakeScreen(app)
             // drop "hey micro" and keep the rest as the command
-            var rest = (text.substring(0, at) + " " + text.substring(at + wlen)).trim()
+            val at = low.indexOf(w)
+            var rest = (text.substring(0, at) + " " + text.substring(at + w.length)).trim()
             rest = rest.replace(Regex("(?i)^(hey|hi|hello|ok|okay|अरे|ओए|हे|हेलो|हैलो)\\s+"), "").trim()
             if (rest.isBlank()) {
                 awakeUntil = System.currentTimeMillis() + 25_000
@@ -648,6 +652,7 @@ class Assistant private constructor(private val app: Context) {
             if (!active) return@post
             generation++
             recognizer?.cancel()
+            OfflineStt.cancel()
             state("Thinking…", OrbView.THINK)
         }
         val gen = generation
@@ -668,6 +673,7 @@ class Assistant private constructor(private val app: Context) {
                 log("${Prefs.friendName}: $reply")
                 state("Speaking…", OrbView.SPEAK)
                 recognizer?.cancel()
+                OfflineStt.cancel()
                 speakThenListen(reply)
             }
         }.start()

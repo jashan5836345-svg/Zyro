@@ -86,6 +86,13 @@ object Prefs {
         get() = read("voiceId", "")
         set(v) = write("voiceId", v.trim())
 
+    /** Understand speech with the downloaded offline model instead of Android speech recognition. */
+    var offlineStt: Boolean
+        get() = sp?.getBoolean("offlineStt", false) ?: false
+        set(v) {
+            sp?.edit()?.putBoolean("offlineStt", v)?.apply()
+        }
+
     /** Only react after hearing "Hey Zyro". */
     var wakeWord: Boolean
         get() = sp?.getBoolean("wakeWord", true) ?: true
